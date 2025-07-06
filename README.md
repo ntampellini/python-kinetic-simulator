@@ -44,7 +44,7 @@ sim.run(time=10, t_units="h")
     -> Running simulation for 10 h with the backwards_euler method (3.6 s increments, 10000 iterations)
     Iterations  |##################################################| 100.0% 
     
-    --> Simulation complete (3.1 s)
+    --> Simulation complete (4.2 s)
 
 
 Show results:
@@ -158,7 +158,7 @@ sim.show()
     -> Running simulation for 24 h with the backwards_euler method (8.6 s increments, 10000 iterations)
     Iterations  |##################################################| 100.0% 
     
-    --> Simulation complete (0.3 s)
+    --> Simulation complete (0.4 s)
     
     Final Concentrations:
     A : 0.01 M (0.5 % of initial conc., 99.50 % consumed)
