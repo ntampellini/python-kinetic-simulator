@@ -113,6 +113,13 @@ class FastEquilibriumSolver:
                     i = self.species_to_idx[species]
                     self.stoich_matrix[i, j] = coeff
 
+        # Precompute log(K_eq) once — avoids recomputing it on every solver call.
+        self.log_K_eq = np.log(np.maximum(self.K_eq_values, 1e-15))
+
+        # Warm-start cache: reuse the previous xi as the initial guess.
+        # Concentrations change by ~1% per step, so this is nearly exact.
+        self._xi_cache = None
+
     def calculate_equilibrium_concentrations(self, initial_concentrations, 
                                            bounds_check=False, verbose=False, 
                                            max_iterations=3):
@@ -184,55 +191,38 @@ class FastEquilibriumSolver:
             
             return xi_guess
         
+        # Compute conc_floor once — it only depends on C0, not on xi.
+        conc_floor = max(1e-12, 1e-6 * np.sum(C0))
+
         # Define the system of equations to solve
         def equilibrium_equations(xi):
             """
-            System of equations: equilibrium constraints for each reaction
+            log(Q_j) - log(K_eq_j) = 0 for each fast reaction j.
+            Vectorised: log Q = stoich.T @ log(clipped_concentrations).
             """
-            # Calculate concentrations from extents
             concentrations = C0 + self.stoich_matrix @ xi
-            
-            # Soft penalty for negative concentrations
-            penalty = 0.0
+            log_conc = np.log(np.maximum(concentrations, conc_floor))
+            log_Q = self.stoich_matrix.T @ log_conc          # shape (n_reactions,)
+            equations = log_Q - self.log_K_eq
+
             if bounds_check:
                 negative_mask = concentrations < 0
                 if np.any(negative_mask):
-                    penalty = 1e6 * np.sum(concentrations[negative_mask]**2)
-            
-            equations = np.zeros(self.n_reactions)
-            
-            for j in range(self.n_reactions):
-                # Calculate reaction quotient for reaction j
-                # Q = [products]^stoich / [reactants]^stoich
-                numerator = 1.0
-                denominator = 1.0
-                
-                for i in range(self.n_species):
-                    stoich_coeff = self.stoich_matrix[i, j]
-                    if stoich_coeff != 0:
-                        # Better handling of small concentrations
-                        # Use a concentration floor that's proportional to the initial total
-                        conc_floor = max(1e-12, 1e-6 * np.sum(C0))
-                        conc = max(concentrations[i], conc_floor)
-                        
-                        if stoich_coeff > 0:  # Product
-                            numerator *= conc ** stoich_coeff
-                        else:  # Reactant (stoich_coeff < 0)
-                            denominator *= conc ** abs(stoich_coeff)
-                
-                Q = numerator / denominator
-                
-                # Equilibrium constraint: log(Q) - log(K_eq) = 0
-                # Better numerical stability for extreme K values
-                log_Q = np.log(max(Q, 1e-15))
-                log_K = np.log(max(self.K_eq_values[j], 1e-15))
-                equations[j] = log_Q - log_K
-            
-            # Add penalty to equations if there are negative concentrations
-            if penalty > 0:
-                equations += penalty / self.n_reactions
-            
+                    penalty = 1e6 * np.sum(concentrations[negative_mask] ** 2)
+                    equations += penalty / self.n_reactions
+
             return equations
+
+        def equilibrium_jacobian(xi):
+            """
+            Analytical Jacobian: d(log Q_j)/d(xi_k) = sum_i stoich[i,j]/C_i * stoich[i,k]
+            = stoich.T @ diag(1/C) @ stoich
+            """
+            concentrations = C0 + self.stoich_matrix @ xi
+            inv_C = 1.0 / np.maximum(concentrations, conc_floor)  # shape (n_species,)
+            # (n_reactions, n_species) * (n_species,) -> weighted stoich rows
+            return (self.stoich_matrix.T * inv_C) @ self.stoich_matrix  # (n_reactions, n_reactions)
+
         
         # Calculate bounds for extents
         bounds = None
@@ -256,11 +246,15 @@ class FastEquilibriumSolver:
                 upper = max_forward if max_forward != np.inf else 1e3
                 bounds.append((lower, upper))
         
-        # Iterative solver with improving initial guesses
+        # Iterative solver with warm-start: reuse previous xi as initial guess
+        # since concentrations change by ~1% per step.
         for iteration in range(max_iterations):
             try:
                 if iteration == 0:
-                    xi_guess = get_initial_guess()
+                    if self._xi_cache is not None:
+                        xi_guess = self._xi_cache.copy()
+                    else:
+                        xi_guess = get_initial_guess()
                 else:
                     # Use previous result as starting point, but perturb slightly
                     xi_guess = xi_final * (1 + 0.1 * np.random.normal(0, 1, self.n_reactions))
@@ -268,29 +262,29 @@ class FastEquilibriumSolver:
                 # Solve the system
                 if bounds_check and bounds:
                     bounds_array = np.array(bounds).T
-                    result = least_squares(equilibrium_equations, xi_guess, 
+                    result = least_squares(equilibrium_equations, xi_guess,
+                                         jac=equilibrium_jacobian,
                                          bounds=bounds_array,
                                          method='trf',
                                          ftol=1e-12,
                                          xtol=1e-12)
-                    success = result.success
-                    xi_final = result.x
-                    fun_norm = np.linalg.norm(result.fun)
-                    nfev = result.nfev
-
                 else:
-                    result = least_squares(equilibrium_equations, xi_guess, 
+                    result = least_squares(equilibrium_equations, xi_guess,
+                                         jac=equilibrium_jacobian,
                                          method='lm',
                                          ftol=1e-12,
                                          xtol=1e-12)
-                    success = result.success
-                    xi_final = result.x
-                    fun_norm = np.linalg.norm(result.fun)
-                    nfev = result.nfev
                 
-                if verbose:
-                    print(f"Iteration {iteration + 1}: Convergence: {success}, "
-                          f"Residual norm: {fun_norm:.2e}, Function evals: {nfev}")
+                success = result.success
+                xi_final = result.x
+                fun_norm = np.linalg.norm(result.fun)
+                nfev = result.nfev
+
+                # Update warm-start cache with the converged solution
+                if success:
+                    self._xi_cache = xi_final.copy()
+                    # print(f"Iteration {iteration + 1}: Convergence: {success}, "
+                    #       f"Residual norm: {fun_norm:.2e}, Function evals: {nfev}")
                 
                 # Check convergence quality
                 if success and fun_norm < 1e-8:
