@@ -2,8 +2,7 @@ Import Simulator from library:
 
 
 ```python
-from kinetic_simulator import Simulator
-```
+from python_kinetic_simulator.simulator import Simulator```
 
 Set up a simulation and run it:
 
@@ -65,7 +64,7 @@ sim.show()
 
 
     
-![png](README_files/README_5_1.png)
+![png](assets/README_5_1.png)
     
 
 
@@ -87,7 +86,7 @@ sim.show(
 
 
     
-![png](README_files/README_7_1.png)
+![png](assets/README_7_1.png)
     
 
 
@@ -98,8 +97,10 @@ Simulator data is available for further manipulation:
 import matplotlib.pyplot as plt
 import numpy as np
 
+# results dictionary with concentration vectors
+C_concs = sim.results["C"]
+
 # plot [C] vs. time in a loglog plot
-C_concs = sim.conc_data[:,sim.species_id_dict["C"]]
 plt.loglog(sim.time_data, C_concs, label='Conc. of C over time')
 plt.xlabel('ln(time (s))')
 plt.ylabel('ln(conc. (M))')
@@ -127,7 +128,7 @@ _ = plt.legend()
 
 
     
-![png](README_files/README_9_0.png)
+![png](assets/README_9_0.png)
     
 
 
@@ -171,6 +172,6 @@ sim.show()
 
 
     
-![png](README_files/README_11_1.png)
+![png](assets/README_11_1.png)
     
 
