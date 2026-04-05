@@ -367,8 +367,10 @@ class Simulator:
         and initial concentration, in mol/L
         
         '''
-        conc = conc or 0.
-        energy = energy or 0.
+        if conc is None:
+            conc = 0.
+        if energy is None:
+            energy = 0.
 
         assert conc > -1E-10
 
@@ -453,7 +455,7 @@ class Simulator:
             slowest_k_rate = sorted(rates)[0]
             for hash_name, reaction in self.reactions.items():
 
-                if reaction.get("enforced_K_eq", None):
+                if reaction.get("enforced_K_eq") is not None:
                     reaction["speed_rank"] = "enforced_K_eq"
                     reaction["description"] = f"--> \"{hash_name}\" will be enforced at the provided equilibrium constant (K_eq = {reaction['enforced_K_eq']:.2{'f' if abs(np.log10(reaction['enforced_K_eq']))<2 else 'e'}})."
 
@@ -497,6 +499,10 @@ class Simulator:
         self.method = method
         self.max_equilib_iters = max_equilib_iters
 
+        # Reset cached solver so it is rebuilt with the current species/reactions.
+        if hasattr(self, "equilibrium_solver"):
+            del self.equilibrium_solver
+
         print()
         for reaction in self.reactions.values():
             print(reaction["description"])
@@ -515,8 +521,9 @@ class Simulator:
         self.dt_s = dt_s
         
         iterations = int(np.ceil(time*self.multiplier/self.dt_s))
-        print(f"\n-> Running simulation for {time} {t_units} with the {self.method} method ({self.dt_s:.1{'f' if self.dt_s>0.1 else 'e'}} s increments, {iterations} iterations)")
+        print(f"\n--> Running simulation for {time} {t_units} with the {self.method} method ({self.dt_s:.1{'f' if self.dt_s>0.1 else 'e'}} s increments, {iterations} iterations)")
         plot_num_points = min(PLOT_NUM_POINTS, iterations)
+        save_every = max(1, int(iterations / plot_num_points)) if plot_num_points > 0 else 1
 
         # equilibrate before the main loop
         self._equilibrate_instantaneous_reactions()
@@ -544,7 +551,7 @@ class Simulator:
             self._equilibrate_instantaneous_reactions()
 
             # if it's time, collect a datapoint
-            if i % int(iterations/plot_num_points) == 0:
+            if i % save_every == 0:
                 self._add_status_to_results()
 
             if min(self.current_conc_dict.values()) < -1E-6:
@@ -553,6 +560,7 @@ class Simulator:
                 break
 
         self.time_data = np.array(self.time_data)
+        self.conc_data = np.array(self.conc_data)
 
         print(f"\n--> Simulation complete ({time_to_string(perf_counter()-t_start)})")
 
@@ -584,7 +592,11 @@ class Simulator:
         delta = direct_delta - inverse_delta
 
         if self.method == "backwards_euler":
-            return 1/(1-delta) - 1
+            # True (linearised) backwards Euler: solve C_{n+1} = C_n - v(C_{n+1})*dt
+            # implicitly, giving delta / (1 + delta) instead of the forward delta.
+            # This is unconditionally stable: for any delta > 0 the step is bounded
+            # by C_n and never overshoots into negative territory.
+            return delta / (1 + delta)
         
         elif self.method == "euler":
             return delta
@@ -592,7 +604,7 @@ class Simulator:
     def _equilibrate_instantaneous_reactions(self, **kwargs):
 
             if not hasattr(self, "equilibrium_solver"):
-                self.equilibrium_solver = FastEquilibriumSolver(self.species.keys(), self.reactions)
+                self.equilibrium_solver = FastEquilibriumSolver(list(self.species.keys()), self.reactions)
             
             for _ in range(self.max_equilib_iters):
                 # Solve for equilibrium
@@ -606,7 +618,7 @@ class Simulator:
 
     def _add_status_to_results(self):
         current_concs = np.array(list(self.current_conc_dict.values()))
-        self.conc_data = np.concatenate((self.conc_data, [current_concs]))
+        self.conc_data.append(current_concs)
         self.time_data.append(self.current_time_s)
 
     def show(self, species=None):
