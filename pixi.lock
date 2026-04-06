@@ -4662,7 +4662,7 @@ packages:
 - pypi: ./
   name: python-kinetic-simulator
   version: 0.1.0
-  sha256: 93cd43fcc9f506304a7ef9b6c66ffa0a1a53b576fc38b9d6558be9c5b8b95c71
+  sha256: f5cd98e64f5eddc6a3c04f691a60b0e6a7ce91f06eb91569e3d690f07d13d6a7
   requires_dist:
   - matplotlib
   - scipy
