@@ -91,6 +91,7 @@ select = [
     "ICN001", # unconventional-import-alias
 ]
 ignore = [
+    "N801", # Class name should use CapWords convention
     "N802", # Function name should be lowercase
     "N803", # Invalid-argument-name (non-lowercase)
     "N806", # Non-lowercase variable in function

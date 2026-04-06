@@ -5,6 +5,7 @@ from typing import Any, Iterable, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
+from prettytable import PrettyTable
 from scipy.optimize import least_squares, root
 
 K_BOLTZMANN = 1.380649e-23  # J/K
@@ -16,6 +17,19 @@ PLOT_NUM_POINTS = 1000
 
 # maximum number of computed steps
 MAX_AUTO_STEPS = 1e4
+
+
+class tcolors:
+    """Terminal colors for pretty printing.
+
+    Use like: print(tcolors.RED + "This is red" + tcolors.ENDC)
+    """
+
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    # YELLOW = '\033[93m'
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
 
 
 def time_to_string(total_time: float, verbose: bool = False, digits: int = 1) -> str:
@@ -392,26 +406,39 @@ class Simulator:
         FAST_THRESHOLD_MULTIPLIER = 10.0
         thr_abs_fast_rxn = FAST_THRESHOLD_MULTIPLIER / self.dt_s  # type: ignore[has-type]
 
-        print("\nReaction Classifications for this run:")
+        table = PrettyTable()
+        table.field_names = [
+            tcolors.BOLD + "Reaction" + tcolors.ENDC,
+            tcolors.BOLD + "Faster k (s^-1)" + tcolors.ENDC,
+            tcolors.BOLD + "Speed Rank" + tcolors.ENDC,
+        ]
+
         for hash_name, reaction in self.reactions.items():
             # Skip reactions that were explicitly enforced
             if reaction.get("speed_rank") == "enforced_K_eq":
                 pass
             elif reaction["faster_k"] > thr_abs_fast_rxn:
                 reaction["speed_rank"] = "instantaneous"
-                reaction["description"] = (
-                    f'--> "{hash_name}" is very fast relative to dt: will be considered always at '
-                    + f"equilibrium (Rate = {reaction['faster_k']:.2e} s^-1, "
-                    + f"dt = {self.dt_s:.2e} s)."  # type: ignore[has-type]
+                table.add_row(
+                    [hash_name, f"{reaction['faster_k']:.2e}", "FAST: always at equilibrium"]
                 )
             else:
                 reaction["speed_rank"] = "normal"
-                reaction["description"] = (
-                    f'--> "{hash_name}" will be evolved step-by-step'
-                    f" (Rate = {reaction['faster_k']:.2e} s^-1)."
+                table.add_row(
+                    [hash_name, f"{reaction['faster_k']:.2e}", "SLOW:  evolved step-by-step"]
                 )
 
-            print(reaction["description"])
+        # sort rows by the faster_k value in descending order
+        table._sort_key = lambda row: float(row[1].split(" ")[0])
+
+        # lef-align speed rank and color FAST green and SLOW red
+        table.custom_format[tcolors.BOLD + "Speed Rank" + tcolors.ENDC] = lambda _, x: (
+            tcolors.GREEN + f"{x:<s}" + tcolors.ENDC
+            if "FAST" in x
+            else tcolors.RED + f"{x:<s}" + tcolors.ENDC
+        )
+
+        print(table.get_string())
 
     def _compile_normal_reactions(self) -> None:
         """Build NumPy arrays for fully vectorized normal reaction rates."""
