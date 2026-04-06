@@ -6,7 +6,7 @@ from typing import Any, Iterable, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, root
 
 K_BOLTZMANN = 1.380649e-23  # J/K
 H_PLANCK = 6.62607015e-34  # J*s
@@ -44,58 +44,18 @@ def time_to_string(total_time: float, verbose: bool = False, digits: int = 1) ->
 
     return timestring
 
-
 class FastEquilibriumSolver:
-    """
-    Solver for multiple coupled fast reactions assumed to be at equilibrium.
-
-    Each reaction is defined by:
-    - Stoichiometric matrix (reactants negative, products positive)
-    - Equilibrium constant
-    """
+    """Solver for multiple coupled fast reactions assumed to be at equilibrium."""
 
     def __init__(self, species_names: list[str], reactions: dict[str, dict[str, Any]]) -> None:
-        """
-        Initialize the fast equilibrium solver.
-
-        Parameters
-        ----------
-        species_names : list of str
-            Names of all species involved
-        reactions : dict of dict
-            Dict mapping reaction names to reaction dicts. Each reaction dict contains:
-            - 'K_eq': equilibrium constant
-            - 'speed_rank': 'instantaneous' or 'normal'
-                (only 'instantaneous' reactions are equilibrated)
-            - 'name': reaction name (optional)
-
-        Example:
-        --------
-        reactions = {
-            'rxn1': {
-                'reagents': ['A', 'B'], 'products': ['C'],
-                'K_eq': 10.0, 'speed_rank': 'instantaneous', 'name': 'A+B<->C'
-            },
-            'rxn2': {
-                'reagents': ['C'], 'products': ['D'],
-                'K_eq': 5.0, 'speed_rank': 'instantaneous', 'name': 'C<->D'
-            },
-            'rxn3': {
-                'reagents': ['D'], 'products': ['E'],
-                'K_eq': 2.0, 'speed_rank': 'normal', 'name': 'D->E (slow)'
-            }
-        }
-        """
         self.species_names = species_names
         self.n_species = len(species_names)
 
         # Filter for only instantaneous reactions
         self.fast_reactions = [
-            r
-            for r in reactions.values()
+            r for r in reactions.values()
             if r.get("speed_rank") in ("instantaneous", "enforced_K_eq")
         ]
-        self.all_reactions = reactions  # Keep reference to all reactions
         self.n_reactions = len(self.fast_reactions)
 
         # calculate stoichiometry
@@ -105,12 +65,8 @@ class FastEquilibriumSolver:
                 **{name: +reaction["products"].count(name) for name in reaction["products"]},
             }
 
-        # Create species name to index mapping
         self.species_to_idx = {name: i for i, name in enumerate(species_names)}
-
-        # Build stoichiometric matrix (n_species x n_reactions) for fast reactions only
         self.stoich_matrix = np.zeros((self.n_species, self.n_reactions))
-
         self.K_eq_values = np.zeros(self.n_reactions)
 
         for j, reaction in enumerate(self.fast_reactions):
@@ -121,45 +77,19 @@ class FastEquilibriumSolver:
                     i = self.species_to_idx[species]
                     self.stoich_matrix[i, j] = coeff
 
-        # Precompute log(K_eq) once — avoids recomputing it on every solver call.
         self.log_K_eq = np.log(np.maximum(self.K_eq_values, 1e-15))
+
+        # Cache for warm starting the solver
+        self.last_xi = np.zeros(self.n_reactions)
 
     def calculate_equilibrium_concentrations(
         self,
-        initial_concentrations: dict[str, float],
-        bounds_check: bool = True,
+        C0: np.ndarray,
         verbose: bool = False,
         max_iterations: int = 3,
     ) -> tuple[np.ndarray, np.ndarray, float, bool]:
-        """
-        Calculate equilibrium concentrations for the coupled fast reactions.
-
-        Parameters
-        ----------
-        initial_concentrations : dict
-            Initial concentrations, keys are species names.
-        bounds_check : bool
-            Whether to enforce positive concentrations
-        verbose : bool
-            Print convergence information
-        max_iterations : int
-            Maximum number of solver iterations if convergence fails
-
-        Returns
-        -------
-        equilibrium_concentrations : np.array
-            Equilibrium concentrations in same order as species_names
-        extents : np.array
-            Extents of reaction for each fast reaction
-        success : bool
-            Whether the solver converged
-        """
-        # Convert initial concentrations to array
-        if isinstance(initial_concentrations, dict):
-            C0 = np.array([initial_concentrations.get(name, 0.0) for name in self.species_names])
-        else:
-            C0 = np.array(initial_concentrations)
-
+        """Calculate equilibrium using native NumPy arrays natively."""
+        
         # make sure we should change any concentrations
         if np.sum(C0) < 1e-15:
             return C0, np.zeros(self.n_reactions), np.inf, False
@@ -172,9 +102,7 @@ class FastEquilibriumSolver:
             is_small = concentrations < epsilon
 
             log_conc = np.empty_like(concentrations)
-            # Normal log for valid concentrations
             log_conc[~is_small] = np.log(concentrations[~is_small])
-            # Linear tangent extension for zero or negative values
             log_conc[is_small] = np.log(epsilon) + (concentrations[is_small] - epsilon) / epsilon
 
             log_Q = self.stoich_matrix.T @ log_conc
@@ -183,10 +111,8 @@ class FastEquilibriumSolver:
             # 2. Smooth, differentiable penalty for coupled negative concentrations
             negative_mask = concentrations < 0
             if np.any(negative_mask):
-                # A strong quadratic penalty based on the magnitude of violation
                 violation = concentrations[negative_mask]
                 penalty = 1e8 * np.sum(violation**2)
-                # Distribute the penalty to all equations
                 equations += penalty
 
             return cast("np.ndarray", equations)
@@ -194,84 +120,61 @@ class FastEquilibriumSolver:
         def equilibrium_jacobian(xi: np.ndarray) -> np.ndarray:
             concentrations = C0 + self.stoich_matrix @ xi
 
-            # Exact analytical derivative of the C1-continuous log extension
             epsilon = 1e-12
             is_small = concentrations < epsilon
 
             inv_C = np.empty_like(concentrations)
             inv_C[~is_small] = 1.0 / concentrations[~is_small]
-            inv_C[is_small] = 1.0 / epsilon  # Constant slope matches the linear extension
+            inv_C[is_small] = 1.0 / epsilon
 
             jac = (self.stoich_matrix.T * inv_C) @ self.stoich_matrix
 
-            # 3. Provide the exact analytical derivative of our penalty
             negative_mask = concentrations < 0
             if np.any(negative_mask):
                 dP_dC = np.zeros_like(concentrations)
-                # Derivative of (1e8 * C^2) is (2e8 * C)
                 dP_dC[negative_mask] = 2e8 * concentrations[negative_mask]
-
-                # Chain rule: dP/dxi = dC/dxi * dP/dC
                 dP_dxi = self.stoich_matrix.T @ dP_dC
-
-                # Broadcast the penalty derivative across all rows
                 jac += dP_dxi
 
             return cast("np.ndarray", jac)
 
-        # Calculate bounds for extents
-        bounds = None
-        if bounds_check:
-            bounds = []
-            for j in range(self.n_reactions):
-                max_forward = np.inf
-                max_backward = np.inf
-
-                for i in range(self.n_species):
-                    stoich_coeff = self.stoich_matrix[i, j]
-                    if stoich_coeff < 0:  # Reactant consumed in forward direction
-                        if C0[i] > 1e-12:
-                            max_forward = min(max_forward, C0[i] / abs(stoich_coeff))
-                    elif stoich_coeff > 0:  # Product consumed in reverse direction
-                        if C0[i] > 1e-12:
-                            max_backward = min(max_backward, C0[i] / stoich_coeff)
-
-                # Set conservative bounds
-                lower = -max_backward if max_backward != np.inf else -1e3
-                upper = max_forward if max_forward != np.inf else 1e3
-                bounds.append((lower, upper))
-
-        # Iterative solver: always start from 0 for step-wise updates
+        # Iterative solver block
         for iteration in range(max_iterations):
             try:
                 if iteration == 0:
-                    # The perfect guess for a delta step is always 0
+                    # --- SAFE WARM START ---
+                    xi_guess = self.last_xi.copy()
+                    
+                    # Project guess to strictly obey C >= 0 bounds
+                    C_guess = C0 + self.stoich_matrix @ xi_guess
+                    if np.any(C_guess < 0):
+                        alpha = 1.0
+                        for i in range(self.n_species):
+                            if C_guess[i] < 0:
+                                delta = C_guess[i] - C0[i]
+                                if delta < 0:
+                                    # Scale back the guess to prevent going negative.
+                                    # We use 0.95 to leave a tiny safety margin above exactly 0.
+                                    max_alpha = -C0[i] / delta
+                                    alpha = min(alpha, max_alpha * 0.95)
+                        
+                        # Uniformly scale down the guess to preserve stoichiometry
+                        xi_guess *= alpha
+                        
+                elif iteration == 1:
+                    # --- FALLBACK 1: COLD START ---
+                    # If warm start failed, perfect zero is the mathematically safest fallback
                     xi_guess = np.zeros(self.n_reactions)
                 else:
-                    # If we failed and are retrying, perturb slightly around 0
+                    # --- FALLBACK 2: JITTERED START ---
+                    # If both failed, perturb slightly to escape saddle points
                     xi_guess = np.random.normal(0, 1e-6, self.n_reactions)
 
                 # Solve the system
-                if bounds:
-                    bounds_array = np.array(bounds).T
-                    result = least_squares(
-                        equilibrium_equations,
-                        xi_guess,
-                        jac=equilibrium_jacobian,
-                        bounds=bounds_array,
-                        method="trf",
-                        ftol=1e-12,
-                        xtol=1e-12,
-                    )
-                else:
-                    result = least_squares(
-                        equilibrium_equations,
-                        xi_guess,
-                        jac=equilibrium_jacobian,
-                        method="lm",
-                        ftol=1e-12,
-                        xtol=1e-12,
-                    )
+                result = least_squares(
+                    equilibrium_equations, xi_guess, jac=equilibrium_jacobian,
+                    method="lm", ftol=1e-12, xtol=1e-12,
+                )
 
                 success: bool = result.success
                 xi_final = result.x
@@ -280,85 +183,53 @@ class FastEquilibriumSolver:
                 # Check convergence quality
                 if success and fun_norm < 1e-8:
                     break
-                elif success and fun_norm < 1e-6:
-                    # Acceptable convergence, but check if we can do better
-                    if iteration < max_iterations - 1:
-                        continue
-                    else:
-                        break
+                elif success and fun_norm < 1e-6 and iteration == max_iterations - 1:
+                    break
                 elif not success and iteration == max_iterations - 1:
-                    if verbose:
-                        print("Failed to converge after maximum iterations")
+                    if verbose: print("Failed to converge after maximum iterations")
                     break
 
             except Exception as e:
-                if verbose:
-                    print(f"Iteration {iteration + 1} failed: {e}")
+                if verbose: print(f"Iteration {iteration + 1} failed: {e}")
                 if iteration == max_iterations - 1:
                     return C0, np.zeros(self.n_reactions), np.inf, False
                 continue
 
-        # Calculate final concentrations
+        # --- UPDATE CACHE ---
+        if success:
+            self.last_xi = xi_final.copy()
+        else:
+            self.last_xi = np.zeros(self.n_reactions)
+
+        # Calculate final concentrations...
         C_eq = C0 + self.stoich_matrix @ xi_final
 
-        # Final bounds check and cleanup
+        # Bounds check and cleanup
         if np.any(C_eq < -1e-10):
-            if verbose:
-                print("Warning: Some equilibrium concentrations are significantly negative.")
-            # Try to resolve by reducing problematic extents
+            if verbose: print("Warning: Some equilibrium concentrations are significantly negative.")
             for _attempt in range(3):
                 xi_final *= 0.9
                 C_eq = C0 + self.stoich_matrix @ xi_final
                 if np.all(C_eq >= -1e-15):
                     break
 
-        # Calculate final concentrations before cleanup
         C_eq = C0 + self.stoich_matrix @ xi_final
 
         # Exact Mass-Conserving Projection
-        # If coupled reactions overdrew a species, find the exact multiplier (alpha)
-        # to scale back the extents so the limiting species hits exactly 0.
         if np.any(C_eq < 0):
             alpha = 1.0
             for i in range(self.n_species):
                 if C_eq[i] < 0:
-                    delta = C_eq[i] - C0[i]  # Total change for this species
+                    delta = C_eq[i] - C0[i]
                     if delta < 0:
-                        # We need C0 + alpha * delta >= 0
                         max_alpha = -C0[i] / delta
                         alpha = min(alpha, max_alpha)
-
-            # Scale back all extents uniformly to conserve stoichiometry
             xi_final *= alpha
             C_eq = C0 + self.stoich_matrix @ xi_final
 
-        # Any remaining negatives are pure floating-point noise (e.g., -1e-18).
-        # Setting these to exactly 0.0 is safe and adds negligible mass.
         C_eq[C_eq < 0] = 0.0
 
         return C_eq, xi_final, fun_norm, success
-
-    def get_equilibrium_dict(
-        self, initial_concentrations: dict[str, float], **kwargs: Any
-    ) -> tuple[dict[str, float], float]:
-        """Return equilibrium concentrations as a dict."""
-        if len(self.fast_reactions) > 0:
-            C_eq, xi, fun_norm, success = self.calculate_equilibrium_concentrations(
-                initial_concentrations, **kwargs
-            )
-
-            result = {name: C_eq[i] for i, name in enumerate(self.species_names)}
-            result["_extents"] = xi
-            result["_success"] = success
-
-        else:
-            result = {name: initial_concentrations[name] for name in self.species_names}
-            result["_extents"] = "N/A"
-            result["_success"] = True
-            fun_norm = 0
-
-        return result, fun_norm
-
 
 class Simulator:
     """Simulator for kinetic schemes with flexible reactions and equilibria definitions."""
@@ -385,6 +256,8 @@ class Simulator:
             "energy": float(energy),
             "conc": float(conc),
         }
+
+        self.species_names = list(self.species.keys())
 
         # update current conc dict
         self.current_conc_dict = {name: state["conc"] for name, state in self.species.items()}
@@ -414,7 +287,7 @@ class Simulator:
         """
         # check if we know all names
         for name in set(reagents + products):
-            if name not in self.species.keys():
+            if name not in self.species_names:
                 raise NameError(f'State name "{name}" not defined.')
 
         # create a reaction hash string
@@ -460,6 +333,7 @@ class Simulator:
             }
 
         if throughput_tgt:
+            raise NotImplementedError(f"Reimplement this!")
             self.reactions[hash_name]["cumulative_throughput"] = 0.0
             self.reactions[hash_name]["throughput_tgt"] = throughput_tgt
 
@@ -531,9 +405,95 @@ class Simulator:
 
             print(reaction["description"])
 
+    def _compile_normal_reactions(self) -> None:
+        """Build NumPy arrays for fully vectorized normal reaction rates."""
+        self.normal_rxns = [r for r in self.reactions.values() if r.get("speed_rank") == "normal"]
+        self.n_normal = len(self.normal_rxns)
+        self.n_species = len(self.species_names)
+
+        # N_species x M_reactions matrices
+        self.nu_reactants = np.zeros((self.n_species, self.n_normal))
+        self.nu_products = np.zeros((self.n_species, self.n_normal))
+        
+        self.kf_vec = np.zeros(self.n_normal)
+        self.kb_vec = np.zeros(self.n_normal)
+
+        for j, rxn in enumerate(self.normal_rxns):
+            self.kf_vec[j] = rxn["k_rate"]
+            self.kb_vec[j] = rxn["k_inv"]
+            
+            for r in rxn["reagents"]:
+                self.nu_reactants[self.species_id_dict[r], j] += 1
+            for p in rxn["products"]:
+                self.nu_products[self.species_id_dict[p], j] += 1
+
+        # Net stoichiometry matrix (Delta)
+        self.nu_net = self.nu_products - self.nu_reactants
+
+    def _calculate_rates(self, C_array: np.ndarray) -> np.ndarray:
+        """Calculate rates for all normal reactions simultaneously."""
+        # Add epsilon to prevent log(0) warnings
+        C_safe = np.maximum(C_array, 1e-15)
+        
+        # Log-space dot product for extreme performance
+        log_C = np.log(C_safe)
+        forward_rates = self.kf_vec * np.exp(self.nu_reactants.T @ log_C)
+        backward_rates = self.kb_vec * np.exp(self.nu_products.T @ log_C)
+        
+        return forward_rates - backward_rates
+
+    def _normal_reactions_step(self) -> None:
+        """Evolve all normal reactions using an implicit Backward Euler step via SciPy."""
+        if self.n_normal == 0:
+            return
+            
+        C0 = self.C_array.copy()
+
+        def residual(C_next: np.ndarray) -> np.ndarray:
+            """Residual for Backward Euler: F(C_{n+1}) = C_{n+1} - C_n - dt * f(C_{n+1}) = 0"""
+            # Prevent negative concentrations during solver steps
+            C_safe = np.maximum(C_next, 1e-15)
+            rates = self._calculate_rates(C_safe)
+            
+            # The rate of change for each species is nu_net @ rates
+            return C_next - C0 - self.dt_s * (self.nu_net @ rates)
+
+        # 'hybr' is MINPACK's Powell hybrid method, excellent for systems of nonlinear equations
+        sol = root(residual, C0, method='hybr')
+
+        # Update the main state array, clamping to 0 to eliminate floating-point noise
+        self.C_array = np.maximum(sol.x, 0.0)
+
+    def get_sim_time(self) -> tuple[float, str]:
+        """Return an estimated simulation time and unit of measure."""
+
+        # 5 half lives should lead to >95% progress for the slowest reaction
+        N_HALF_LIVES = 5
+        
+        slowest_k_fwd = min([rxn["k_rate"] for rxn in self.reactions.values()])
+
+        assert slowest_k_fwd > 0, "All reactions must have a positive forward rate constant to estimate simulation time."
+
+        t_half_life = np.log(2) / slowest_k_fwd
+        t_s = N_HALF_LIVES * t_half_life
+        t_m = t_s // 60
+        t_h = t_m // 60
+        
+        match True:
+            case _ if t_s < 60:
+                output = (t_s, "s")
+            case _ if t_m < 60:
+                output = (t_m, "m")
+            case _:
+                output = (t_h, "h")
+
+        print(f"--> Estimated simulation time: {output[0]:.1f} {output[1]} (based on slowest reaction)")
+
+        return output
+
     def run(
         self,
-        time: float = 1,
+        time: float | None = None,
         t_units: str = "s",
         dt_s: float | None = None,
         max_equilib_iters: int = 5,
@@ -553,14 +513,28 @@ class Simulator:
             "d": 3600 * 24,
         }[t_units]
 
+        if time is None:
+            time, t_units = self.get_sim_time()
+
+        time_s = time * self.multiplier
+
         if dt_s is None:
-            dt_s = time * self.multiplier / MAX_AUTO_STEPS
+            dt_s = time_s / MAX_AUTO_STEPS
 
         self.dt_s = dt_s
 
+        # evaluate which reactions are instantaneous
+        # vs normal based on the provided or default dt_s
         self.evaluate_dynamic_kinetic_ranking()
 
-        iterations = int(np.ceil(time * self.multiplier / self.dt_s))
+        # with that, precompile the normal reactions for
+        # fast vectorized stepping in the main loop
+        self._compile_normal_reactions()
+
+        # Initialize the working concentration array
+        self.C_array = np.array([self.species[name]["conc"] for name in self.species_names])
+
+        iterations = int(np.ceil(time_s / self.dt_s))
         print(
             f"\n--> Running simulation for {time} {t_units} with the Backwards Euler method "
             f"({self.dt_s:.1{'f' if self.dt_s > 0.1 else 'e'}} "
@@ -568,9 +542,6 @@ class Simulator:
         )
         plot_num_points = min(PLOT_NUM_POINTS, iterations)
         save_every = max(1, int(iterations / plot_num_points)) if plot_num_points > 0 else 1
-
-        # equilibrate before the main loop
-        self._equilibrate_instantaneous_reactions()
 
         # Calculate total number of data points
         total_points = 1 + (iterations // save_every)
@@ -580,20 +551,23 @@ class Simulator:
         self.conc_data = np.zeros((total_points, len(self.species)))
         self.data_idx = 0
 
+        t_start = perf_counter()
+
+        # set solver and equilibrate before the main loop
+        self.equilibrium_solver = FastEquilibriumSolver(list(self.species_names), self.reactions)
+        self._equilibrate_instantaneous_reactions()
+
         # Set initial data point
         self.time_data[self.data_idx] = 0.0
-        self.conc_data[self.data_idx] = np.array(list(self.current_conc_dict.values()))
+        self.conc_data[self.data_idx] = self.C_array[:]
         self.data_idx += 1
 
-        t_start = perf_counter()
         for i in range(1, iterations + 1):
             self.current_time_s = self.dt_s * i
             loadbar(i, iterations, prefix="Iterations ")
 
-            # first, iteratively evolve all normal reactions
-            for rxn in self.reactions.values():
-                if rxn["speed_rank"] == "normal":
-                    self._normal_reaction_step(rxn)
+            # first, evolve all normal reactions
+            self._normal_reactions_step()
 
             # then, equilibrate all instantaneous reactions together
             self._equilibrate_instantaneous_reactions()
@@ -610,109 +584,109 @@ class Simulator:
                 print(s)
                 break
 
-        self.results = dict(zip(self.species.keys(), self.conc_data.T, strict=True))
+        self.results = dict(zip(self.species_names, self.conc_data.T, strict=True))
 
         print(f"\n--> Simulation complete ({time_to_string(perf_counter() - t_start)})")
 
-    def _normal_reaction_step(self, rxn: dict[str, Any]) -> None:
-        """Evolve normal (slow) reaction by one iteration."""
-        deltaC = self._get_deltaC_step(rxn)
+    # def _normal_reaction_step(self, rxn: dict[str, Any]) -> None:
+    #     """Evolve normal (slow) reaction by one iteration."""
+    #     deltaC = self._get_deltaC_step(rxn)
 
-        # Bckw Euler + mass balance
-        for reagent in rxn["reagents"]:
-            self.current_conc_dict[reagent] -= deltaC
+    #     # Bckw Euler + mass balance
+    #     for reagent in rxn["reagents"]:
+    #         self.current_conc_dict[reagent] -= deltaC
 
-        for product in rxn["products"]:
-            self.current_conc_dict[product] += deltaC
+    #     for product in rxn["products"]:
+    #         self.current_conc_dict[product] += deltaC
 
-        if "cumulative_throughput" in rxn:
-            rxn["cumulative_throughput"] += deltaC * rxn["products"].count(rxn["throughput_tgt"])
+    #     if "cumulative_throughput" in rxn:
+    #         rxn["cumulative_throughput"] += deltaC * rxn["products"].count(rxn["throughput_tgt"])
 
-    def _get_deltaC_step(self, rxn: dict[str, Any]) -> float:
-        """Return implicit Newton iteration step on reaction extent (robust for stiff kinetics)."""
-        dt = self.dt_s
+    # def _get_deltaC_step(self, rxn: dict[str, Any]) -> float:
+    #     """Return implicit Newton iteration step on reaction extent (robust for stiff kinetics)."""
+    #     dt = self.dt_s
 
-        # Stoichiometry
-        reagents = rxn["reagents"]
-        products = rxn["products"]
+    #     # Stoichiometry
+    #     reagents = rxn["reagents"]
+    #     products = rxn["products"]
 
-        # Initial concentrations
-        C0 = self.current_conc_dict
+    #     # Initial concentrations
+    #     C0 = self.current_conc_dict
 
-        # Precompute multiplicities (handles duplicates correctly)
-        nu_reac = Counter(reagents)
-        nu_prod = Counter(products)
+    #     # Precompute multiplicities (handles duplicates correctly)
+    #     nu_reac = Counter(reagents)
+    #     nu_prod = Counter(products)
 
-        kf = rxn["k_rate"]
-        kb = rxn["k_inv"]
+    #     kf = rxn["k_rate"]
+    #     kb = rxn["k_inv"]
 
-        # Bounds: cannot consume more than available
-        max_forward = min(C0[r] / nu_reac[r] for r in nu_reac) if nu_reac else np.inf
-        max_backward = min(C0[p] / nu_prod[p] for p in nu_prod) if nu_prod else np.inf
+    #     # Bounds: cannot consume more than available
+    #     max_forward = min(C0[r] / nu_reac[r] for r in nu_reac) if nu_reac else np.inf
+    #     max_backward = min(C0[p] / nu_prod[p] for p in nu_prod) if nu_prod else np.inf
 
-        # Initial guess: explicit Euler
-        def rate(C: dict[str, float]) -> float:
-            forward = kf * np.prod([C[r] ** nu_reac[r] for r in nu_reac])
-            backward = kb * np.prod([C[p] ** nu_prod[p] for p in nu_prod])
-            return cast("float", forward - backward)
+    #     # Initial guess: explicit Euler
+    #     def rate(C: dict[str, float]) -> float:
+    #         forward = kf * np.prod([C[r] ** nu_reac[r] for r in nu_reac])
+    #         backward = kb * np.prod([C[p] ** nu_prod[p] for p in nu_prod])
+    #         return cast("float", forward - backward)
 
-        delta = dt * rate(C0)
+    #     delta = dt * rate(C0)
 
-        # Clamp initial guess
-        delta = max(-max_backward, min(delta, max_forward))
+    #     # Clamp initial guess
+    #     delta = max(-max_backward, min(delta, max_forward))
 
-        # Newton iterations
-        for _ in range(8):
-            # Build updated concentrations
-            C = {}
-            for s in C0:
-                C[s] = C0[s]
+    #     # Newton iterations
+    #     for _ in range(8):
+    #         # Build updated concentrations
+    #         C = {}
+    #         for s in C0:
+    #             C[s] = C0[s]
 
-            for r in nu_reac:
-                C[r] -= nu_reac[r] * delta
-            for p in nu_prod:
-                C[p] += nu_prod[p] * delta
+    #         for r in nu_reac:
+    #             C[r] -= nu_reac[r] * delta
+    #         for p in nu_prod:
+    #             C[p] += nu_prod[p] * delta
 
-            # Prevent negative concentrations during iteration
-            for s, val in C.items():
-                C[s] = max(val, 1e-15)
+    #         # Prevent negative concentrations during iteration
+    #         for s, val in C.items():
+    #             C[s] = max(val, 1e-15)
 
-            # f(Δ)
-            f = delta - dt * rate(C)
+    #         # f(Δ)
+    #         f = delta - dt * rate(C)
 
-            # Numerical derivative df/dΔ
-            eps = 1e-8 * max(1.0, abs(delta))
-            delta_eps = delta + eps
+    #         # Numerical derivative df/dΔ
+    #         eps = 1e-8 * max(1.0, abs(delta))
+    #         delta_eps = delta + eps
 
-            C_eps: dict[str, float] = {}
-            for s in C0:
-                C_eps[s] = C0[s]
-            for r in nu_reac:
-                C_eps[r] -= nu_reac[r] * delta_eps
-            for p in nu_prod:
-                C_eps[p] += nu_prod[p] * delta_eps
+    #         C_eps: dict[str, float] = {}
+    #         for s in C0:
+    #             C_eps[s] = C0[s]
+    #         for r in nu_reac:
+    #             C_eps[r] -= nu_reac[r] * delta_eps
+    #         for p in nu_prod:
+    #             C_eps[p] += nu_prod[p] * delta_eps
 
-            # Prevent negative concentrations again
-            for s, val in C_eps.items():
-                C_eps[s] = max(val, 1e-15)
+    #         # Prevent negative concentrations again
+    #         for s, val in C_eps.items():
+    #             C_eps[s] = max(val, 1e-15)
 
-            f_eps = delta_eps - dt * rate(C_eps)
+    #         f_eps = delta_eps - dt * rate(C_eps)
 
-            df = (f_eps - f) / eps
+    #         df = (f_eps - f) / eps
 
-            if abs(df) < 1e-12:
-                break
+    #         if abs(df) < 1e-12:
+    #             break
 
-            step = f / df
-            delta -= step
+    #         step = f / df
+    #         delta -= step
 
-            # Clamp to physical bounds
-            delta = max(-max_backward, min(delta, max_forward))
+    #         # Clamp to physical bounds
+    #         delta = max(-max_backward, min(delta, max_forward))
 
-            if abs(step) < 1e-12:
-                break
+    #         if abs(step) < 1e-12:
+    #             break
 
-        return delta
+    #     return delta
 
     def _equilibrate_instantaneous_reactions(self, **kwargs: Any) -> None:
         """Equilibrate all instantaneous reactions together using the FastEquilibriumSolver.
@@ -720,28 +694,26 @@ class Simulator:
         This method is called before the main loop to equilibrate the initial state,
         and after each normal reaction step to re-equilibrate the fast reactions.
         """
-        if not hasattr(self, "equilibrium_solver"):
-            self.equilibrium_solver = FastEquilibriumSolver(
-                list(self.species.keys()), self.reactions
-            )
+
+        if self.equilibrium_solver.n_reactions == 0:
+            return
 
         for _ in range(self.max_equilib_iters):
-            # Solve for equilibrium
-            new_conc_dict, fun_norm = self.equilibrium_solver.get_equilibrium_dict(
-                self.current_conc_dict, **kwargs
+            # Pass C_array directly to the solver
+            C_eq, _, fun_norm, _ = self.equilibrium_solver.calculate_equilibrium_concentrations(
+                self.C_array, **kwargs
             )
-
-            for species in self.species.keys():
-                self.current_conc_dict[species] = new_conc_dict[species]
+            
+            # Update array in place
+            self.C_array = C_eq
 
             if fun_norm < 1e-2 or fun_norm == np.inf:
                 break
 
     def _add_status_to_results(self) -> None:
-        """Add the current concentrations and time to the results arrays for plotting."""
-        current_concs = np.array(list(self.current_conc_dict.values()))
+        """Add the current concentrations and time to the results arrays."""
         self.time_data[self.data_idx] = self.current_time_s
-        self.conc_data[self.data_idx] = current_concs
+        self.conc_data[self.data_idx] = self.C_array.copy()
         self.data_idx += 1
 
     def show(self, species: Iterable[str] | None = None) -> None:
@@ -756,7 +728,7 @@ class Simulator:
         plt.figure()
         print("\nFinal Concentrations:")
         sum_of_final_concs = np.sum([concs[-1] for concs in self.results.values()])
-        longest = max(len(name) for name in self.species.keys())
+        longest = max(len(name) for name in self.species_names)
 
         for name, concs in self.results.items():
             if name in species_to_plot:
@@ -780,7 +752,7 @@ class Simulator:
             if "cumulative_throughput" in reaction:
                 fraction = (
                     reaction["cumulative_throughput"]
-                    / self.current_conc_dict[reaction["throughput_tgt"]]
+                    / self.results[reaction["throughput_tgt"]][-1]
                 )
                 print(
                     f'Reaction "{hash_name}" throughput is '
