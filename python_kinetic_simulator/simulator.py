@@ -12,16 +12,6 @@ K_BOLTZMANN = 1.380649e-23  # J/K
 H_PLANCK = 6.62607015e-34  # J*s
 R = 0.001985877534  # kcal/(mol*K)
 
-# A reaction is considered instantaneous if
-# more than THR_REL_FAST_RXN times faster than
-# the slowest reaction of the run
-THR_REL_FAST_RXN = 1e3
-
-# steps must bring about a realtive change to the
-# concentration of a species that is less than
-# MAX_REL_CHANGE_PER_STEP (0.01 = 1%)
-MAX_REL_CHANGE_PER_STEP = 0.01
-
 # number of points to save to generate final plot
 PLOT_NUM_POINTS = 1000
 
@@ -406,15 +396,17 @@ class Simulator:
         products: list[str],
         ts_energy: float | None = None,
         rate: float | None = None,
+        inv_rate: float | None = None,
         throughput_tgt: str | None = None,
         enforced_K_eq: float | None = None,
     ) -> None:
         """Add a reaction with reagents, products, and either a TS energy or a rate constant.
 
         Reagents and product: lists of strings
-        ts_energy: absoolute value relative to the
+        ts_energy: absolute value relative to the
             whole PES, in kcal/mol (overrides rate)
         rate: forward reaction rate, in M^n * s^-1 (overridden by ts_energy)
+        inv_rate: reverse reaction rate, in M^n * s^-1 (overridden by ts_energy)
         throughput_tgt: string with species name - will keep track of how
             much of this species is generated through this reaction
         enforced_K_eq: will consider the reaction instantaneous and always at
@@ -436,35 +428,31 @@ class Simulator:
             }
 
         else:
-            if ts_energy is None:
-                if rate is not None:
-                    ts_energy = self.get_ts_energy(reagents, rate)
-                else:
-                    raise RuntimeError(
-                        "Please provide either the reaction rate or absolute ts_energy"
-                    )
+            if ts_energy is not None:
+                # calculate the activation energy relative to the reagents
+                activation_energy = ts_energy - np.sum(
+                    [self.species[name]["energy"] for name in reagents]
+                )
+                inverse_act_energy = ts_energy - np.sum(
+                    [self.species[name]["energy"] for name in products]
+                )
 
-            # calculate the activation energy relative to the reagents
-            activation_energy = ts_energy - np.sum(
-                [self.species[name]["energy"] for name in reagents]
-            )
-            inverse_act_energy = ts_energy - np.sum(
-                [self.species[name]["energy"] for name in products]
-            )
+                # calculate reaction rates
+                k_rate = get_eyring_k(activation_energy, self.T)
+                k_inv = get_eyring_k(inverse_act_energy, self.T)
 
-            # calculate reaction rates
-            k_rate = get_eyring_k(activation_energy, self.T)
-            k_inv = get_eyring_k(inverse_act_energy, self.T)
+            elif rate is not None:
+                k_rate = rate
+                k_inv = inv_rate or 0.0
+
+            else:
+                raise RuntimeError("Please provide either the reaction rate or absolute ts_energy")
 
             # add the reaction to the self.reactions attribute
             self.reactions[hash_name] = {
                 "reagents": reagents,
                 "products": products,
-                "activation_energy": activation_energy,
-                "inverse_act_energy": inverse_act_energy,
-                "smaller_act_energy": activation_energy
-                if activation_energy < inverse_act_energy
-                else inverse_act_energy,
+                "activation_energy": self.get_ts_energy(reagents, k_rate),
                 "k_rate": k_rate,
                 "k_inv": k_inv,
                 "faster_k": k_rate if k_rate > k_inv else k_inv,
