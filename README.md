@@ -40,18 +40,20 @@ sim.run(time=10, t_units="h")
 # sim.run(time=0)
 ```
 
-    +------------------+-----------------+----------+-----------------------------+
-    |     Reaction     | Faster k (s^-1) |   K_eq   |          Speed Rank         |
-    +------------------+-----------------+----------+-----------------------------+
-    |    A -> B + B    |     1.83e-03    | 5.09e+02 | SLOW:  evolved step-by-step |
-    |      B -> C      |     5.00e-04    | 8.89e+18 | SLOW:  evolved step-by-step |
-    | B -> B(adsorbed) |      N / A      | 2.18e+00 | K_EQ: always at equilibrium |
-    +------------------+-----------------+----------+-----------------------------+
+    +---+------------------+-----------------+----------+--------------------------------------+
+    | # |     Reaction     | Faster k (s^-1) |   K_eq   |              Speed Rank              |
+    +---+------------------+-----------------+----------+--------------------------------------+
+    | 1 |    A -> B + B    |     1.83e-03    | 5.09e+02 | KINETIC, SLOW:  evolved step-by-step |
+    | 2 |      B -> C      |     5.00e-04    | 8.89e+18 | KINETIC, SLOW:  evolved step-by-step |
+    | 3 | B -> B(adsorbed) |      N / A      | 2.18e+00 | THERMODYNAMIC: always at equilibrium |
+    +---+------------------+-----------------+----------+--------------------------------------+
 
-    --> Running simulation for 10 h with the Backwards Euler method (3.6 s increments, 10000 iterations)
+    --> Running simulation for 10 h with the LSODA method (36.0 s increments, 1000 iterations)
+    --> Pre-equilibrated 1 THERMODYNAMIC and FAST reactions before starting the main loop.
     Iterations  |##################################################| 100.0%
 
-    --> Simulation complete (3.0 s)
+    --> Simulation complete (0.8 s)
+
 
 Show results:
 
@@ -64,14 +66,14 @@ sim.show()
     Final Concentrations:
     A           : 0.00 M (0.0 % of initial conc., 100.00 % consumed)
     B           : 0.00 M (0.12 % total molar fraction)
-    B(adsorbed) : 0.01 M (0.26 % total molar fraction)
-    C           : 1.99 M (99.62 % total molar fraction)
+    B(adsorbed) : 0.01 M (0.27 % total molar fraction)
+    C           : 1.99 M (99.61 % total molar fraction)
 
 
 
 
 
-![png](assets/README_files/README_5_1.png)
+![png](assets/README_files/README_5_2.png)
 
 
 
@@ -85,7 +87,7 @@ sim.show(species=("B", "B(adsorbed)"))
 
     Final Concentrations:
     B           : 0.00 M (0.12 % total molar fraction)
-    B(adsorbed) : 0.01 M (0.26 % total molar fraction)
+    B(adsorbed) : 0.01 M (0.27 % total molar fraction)
 
 
 
@@ -109,7 +111,7 @@ plt.xlabel("ln(time (s))")
 plt.ylabel("ln(conc. (M))")
 
 # define and plot an interpolation time range
-start, end = 5e1, 5e2  # 1E3
+start, end = 5e1, 1e2  # 1E3
 plt.axvspan(start, end, color="red", alpha=0.25, label="interpolation area")
 
 # get boundary indices of arrays
@@ -143,3 +145,50 @@ _ = plt.legend()
 
 
 ![png](assets/README_files/README_9_0.png)
+
+
+
+It is also possible to track how much material was obtained through different pathways:
+
+
+```python
+sim = Simulator()
+
+sim.add_species("A", conc=1)
+sim.add_species("B", energy=0.8)
+sim.add_species("C", energy=-30)
+
+sim.add_reaction(["A"], ["B"], ts_energy=20.0)
+sim.add_reaction(["A", "B"], ["C", "C"], ts_energy=22.1, throughput_tgt="C")
+sim.add_reaction(["A", "A"], ["C", "C"], ts_energy=21.5, throughput_tgt="C")
+
+sim.run(time=24, t_units="h")
+
+sim.show()
+```
+
+    +---+----------------+-----------------+----------+--------------------------------------+
+    | # |    Reaction    | Faster k (s^-1) |   K_eq   |              Speed Rank              |
+    +---+----------------+-----------------+----------+--------------------------------------+
+    | 1 |     A -> B     |     5.13e-02    | 2.59e-01 | KINETIC, SLOW:  evolved step-by-step |
+    | 2 | A + B -> C + C |     1.25e-03    | 3.95e+44 | KINETIC, SLOW:  evolved step-by-step |
+    | 3 | A + A -> C + C |     1.05e-03    | 1.02e+44 | KINETIC, SLOW:  evolved step-by-step |
+    +---+----------------+-----------------+----------+--------------------------------------+
+
+    --> Running simulation for 24 h with the LSODA method (86.4 s increments, 1000 iterations)
+    Iterations  |##################################################| 100.0%
+
+    --> Simulation complete (0.4 s)
+
+    Final Concentrations:
+    A : 0.01 M (0.5 % of initial conc., 99.47 % consumed)
+    B : 0.00 M (0.14 % total molar fraction)
+    C : 0.99 M (99.34 % total molar fraction)
+
+    Reaction "A + B -> C + C" throughput is 0.228 M, 22.93 % of final "C" conc.
+    Reaction "A + A -> C + C" throughput is 0.766 M, 77.07 % of final "C" conc.
+
+
+
+
+![png](assets/README_files/README_11_1.png)

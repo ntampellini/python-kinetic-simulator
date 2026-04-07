@@ -366,9 +366,8 @@ class Simulator:
             }
 
         if throughput_tgt:
-            raise NotImplementedError("Willi try to re-implement this...")
-            # self.reactions[hash_name]["cumulative_throughput"] = 0.0
-            # self.reactions[hash_name]["throughput_tgt"] = throughput_tgt
+            self.reactions[hash_name]["cumulative_throughput"] = 0.0
+            self.reactions[hash_name]["throughput_tgt"] = throughput_tgt
             # self.track_throughput.append(self.reactions[hash_name])
 
         # We no longer calculate speed_rank here unless it is strictly
@@ -509,6 +508,20 @@ class Simulator:
 
         self.nu_net = self.nu_products - self.nu_reactants
 
+        # Compile throughput tracking
+        self.tracked_rxns = []
+        for j, rxn in enumerate(self.ode_rxns):
+            if "throughput_tgt" in rxn:
+                tgt = rxn["throughput_tgt"]
+                # Calculate the net coefficient of the target in this specific reaction
+                coeff = rxn["products"].count(tgt) - rxn["reagents"].count(tgt)
+                self.tracked_rxns.append({"idx": j, "coeff": coeff, "reaction_ref": rxn})
+
+        self.n_tracked = len(self.tracked_rxns)
+        if self.n_tracked > 0:
+            self.tracked_indices = np.array([t["idx"] for t in self.tracked_rxns])
+            self.tracked_coeffs = np.array([t["coeff"] for t in self.tracked_rxns])
+
     def _calculate_rates(self, C_array: np.ndarray) -> np.ndarray:
         """Calculate rates for all normal reactions simultaneously."""
         # Add epsilon to prevent log(0) warnings
@@ -526,16 +539,29 @@ class Simulator:
         if self.n_ode == 0:
             return
 
-        def odefun(t: float, C: np.ndarray) -> np.ndarray:
-            # Calculate rates. C_safe prevents log(0) warnings.
+        def odefun(t: float, y: np.ndarray) -> np.ndarray:
+            # Extract species concentrations from the state vector
+            C = y[: self.n_species]
             rates = self._calculate_rates(C)
-            # The rate of change for each species is nu_net @ rates
-            return self.nu_net @ rates  # type: ignore
+            dC_dt = self.nu_net @ rates
+
+            # If tracking throughput, append the target rates to the ODE derivative
+            if self.n_tracked > 0:
+                dT_dt = rates[self.tracked_indices] * self.tracked_coeffs
+                return np.concatenate((dC_dt, dT_dt))
+
+            return dC_dt  # type: ignore
+
+        # Prepare initial state vector (concentrations + existing throughputs)
+        if self.n_tracked > 0:
+            y0 = np.concatenate((self.C_array, self.throughput_array))  # type: ignore[has-type]
+        else:
+            y0 = self.C_array  # type: ignore[has-type]
 
         sol = solve_ivp(
             odefun,
             (0.0, self.dt_s),  # type: ignore[has-type]
-            self.C_array,  # type: ignore[has-type]
+            y0,
             method=IVP_METHOD,
             rtol=1e-6,
             atol=1e-9,
@@ -544,8 +570,11 @@ class Simulator:
         if not sol.success:
             print(f"Warning: ODE solver failed at time {self.current_time_s}: {sol.message}")  # type: ignore[has-type]
 
-        # Update the main state array, clamping to 0 to eliminate tiny float noise
-        self.C_array = np.maximum(sol.y[:, -1], 0.0)
+        # Slice the integrated results back into their separate arrays
+        self.C_array = np.maximum(sol.y[: self.n_species, -1], 0.0)
+
+        if self.n_tracked > 0:
+            self.throughput_array = sol.y[self.n_species :, -1]
 
     def get_sim_time(self) -> tuple[float, str]:
         """Return an estimated simulation time and unit of measure."""
@@ -619,6 +648,9 @@ class Simulator:
 
         # Initialize the working concentration array
         self.C_array = np.array([self.species[name]["conc"] for name in self.species_names])
+
+        # Initialize throughput tracking array
+        self.throughput_array = np.zeros(getattr(self, "n_tracked", 0))
 
         if self.dt_s != 0:
             iterations = int(np.ceil(time_s / self.dt_s))
@@ -696,6 +728,11 @@ class Simulator:
                 break
 
         self.results = dict(zip(self.species_names, self.conc_data.T, strict=True))
+
+        # Map tracked throughputs back to the reaction dictionaries
+        if getattr(self, "n_tracked", 0) > 0:
+            for i, t_info in enumerate(self.tracked_rxns):
+                t_info["reaction_ref"]["cumulative_throughput"] = float(self.throughput_array[i])
 
         print(f"\n--> Simulation complete ({time_to_string(perf_counter() - t_start)})")
 
