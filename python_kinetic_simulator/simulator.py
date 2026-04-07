@@ -17,8 +17,7 @@ R = 0.001985877534  # kcal/(mol*K)
 MAX_PLOT_NUM_POINTS = 1000
 
 # IVP solver method.
-# BDF: Backward Differentiation Formula,
-# good for stiff systems
+# BDF: Backward Differentiation Formula, good for stiff systems
 # LSODA: automatically switches between non-stiff (Adams) and stiff (BDF) methods
 # seems to be faster for systems that start stiff and become non-stiff.
 IVP_METHOD = "LSODA"
@@ -368,7 +367,6 @@ class Simulator:
         if throughput_tgt:
             self.reactions[hash_name]["cumulative_throughput"] = 0.0
             self.reactions[hash_name]["throughput_tgt"] = throughput_tgt
-            # self.track_throughput.append(self.reactions[hash_name])
 
         # We no longer calculate speed_rank here unless it is strictly
         # enforced by the user. Dynamic kinetic ranking (instantaneous vs normal)
@@ -621,15 +619,15 @@ class Simulator:
         if hasattr(self, "equilibrium_solver"):
             del self.equilibrium_solver  # type: ignore[has-type]
 
+        if time is None:
+            time, t_units = self.get_sim_time()
+
         self.multiplier = {
             "s": 1,
             "m": 60,
             "h": 3600,
             "d": 3600 * 24,
         }[t_units]
-
-        if time is None:
-            time, t_units = self.get_sim_time()
 
         time_s = time * self.multiplier
 
