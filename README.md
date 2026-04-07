@@ -34,19 +34,24 @@ sim.add_reaction(["B"], ["B(adsorbed)"], enforced_K_eq=2.18)
 
 # specify the timeframe of the simulation and run it
 sim.run(time=10, t_units="h")
+
+# running simulations with time=0 is also possible
+# to get equilibrium concentrations
+# sim.run(time=0)
 ```
 
-    
-    Reaction Classifications for this run:
-    --> "A -> B + B" will be evolved step-by-step (Rate = 1.83e-03 s^-1).
-    --> "B -> C" will be evolved step-by-step (Rate = 5.00e-04 s^-1).
-    --> "B -> B(adsorbed)" will be enforced at the provided equilibrium constant (K_eq = 2.18e+00).
-    
-    --> Running simulation for 10 h with the Backwards Euler method (3.6 s increments, 10000 iterations)
-    Iterations  |##################################################| 100.0% 
-    
-    --> Simulation complete (5.5 s)
+    +------------------+-----------------+----------+-----------------------------+
+    |     Reaction     | Faster k (s^-1) |   K_eq   |          Speed Rank         |
+    +------------------+-----------------+----------+-----------------------------+
+    |    A -> B + B    |     1.83e-03    | 5.09e+02 | SLOW:  evolved step-by-step |
+    |      B -> C      |     5.00e-04    | 8.89e+18 | SLOW:  evolved step-by-step |
+    | B -> B(adsorbed) |      N / A      | 2.18e+00 | K_EQ: always at equilibrium |
+    +------------------+-----------------+----------+-----------------------------+
 
+    --> Running simulation for 10 h with the Backwards Euler method (3.6 s increments, 10000 iterations)
+    Iterations  |##################################################| 100.0%
+
+    --> Simulation complete (3.0 s)
 
 Show results:
 
@@ -55,19 +60,19 @@ Show results:
 sim.show()
 ```
 
-    
+
     Final Concentrations:
     A           : 0.00 M (0.0 % of initial conc., 100.00 % consumed)
     B           : 0.00 M (0.12 % total molar fraction)
     B(adsorbed) : 0.01 M (0.26 % total molar fraction)
     C           : 1.99 M (99.62 % total molar fraction)
-    
 
 
 
-    
+
+
 ![png](assets/README_files/README_5_1.png)
-    
+
 
 
 Only visualize the evolution of some species:
@@ -77,17 +82,17 @@ Only visualize the evolution of some species:
 sim.show(species=("B", "B(adsorbed)"))
 ```
 
-    
+
     Final Concentrations:
     B           : 0.00 M (0.12 % total molar fraction)
     B(adsorbed) : 0.01 M (0.26 % total molar fraction)
-    
 
 
 
-    
+
+
 ![png](assets/README_files/README_7_1.png)
-    
+
 
 
 Simulator data is available for further manipulation:
@@ -136,52 +141,5 @@ _ = plt.legend()
 ```
 
 
-    
+
 ![png](assets/README_files/README_9_0.png)
-    
-
-
-It is also possible to track how much material was obtained through different pathways:
-
-
-```python
-sim = Simulator()
-
-sim.add_species("A", conc=1)
-sim.add_species("B", energy=0.8)
-sim.add_species("C", energy=-30)
-
-sim.add_reaction(["A"], ["B"], ts_energy=20.0)
-sim.add_reaction(["A", "B"], ["C", "C"], ts_energy=22.1, throughput_tgt="C")
-sim.add_reaction(["A", "A"], ["C", "C"], ts_energy=21.5, throughput_tgt="C")
-
-sim.run(time=24, t_units="h")
-
-sim.show()
-```
-
-    
-    Reaction Classifications for this run:
-    --> "A -> B" will be evolved step-by-step (Rate = 5.13e-02 s^-1).
-    --> "A + B -> C + C" will be evolved step-by-step (Rate = 1.48e-03 s^-1).
-    --> "A + A -> C + C" will be evolved step-by-step (Rate = 1.05e-03 s^-1).
-    
-    --> Running simulation for 24 h with the Backwards Euler method (8.6 s increments, 10000 iterations)
-    Iterations  |##################################################| 100.0% 
-    
-    --> Simulation complete (1.2 s)
-    
-    Final Concentrations:
-    A : 0.01 M (0.5 % of initial conc., 99.50 % consumed)
-    B : 0.00 M (0.13 % total molar fraction)
-    C : 0.99 M (99.37 % total molar fraction)
-    
-    Reaction "A + B -> C + C" throughput is 0.261 M, 26.24 % of final "C" conc.
-    Reaction "A + A -> C + C" throughput is 0.733 M, 73.76 % of final "C" conc.
-
-
-
-    
-![png](assets/README_files/README_11_1.png)
-    
-

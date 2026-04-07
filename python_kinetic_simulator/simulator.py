@@ -25,9 +25,10 @@ class tcolors:
     Use like: print(tcolors.RED + "This is red" + tcolors.ENDC)
     """
 
+    GREY = "\033[90m"
     RED = "\033[91m"
     GREEN = "\033[92m"
-    # YELLOW = '\033[93m'
+    YELLOW = "\033[93m"
     ENDC = "\033[0m"
     BOLD = "\033[1m"
 
@@ -262,6 +263,7 @@ class Simulator:
         self.T_C = T_C
         self.species: dict[str, dict[str, float]] = {}
         self.reactions: dict[str, dict[str, Any]] = {}
+        # self.track_throughput: list[dict[str, Any]] = []
 
     def add_species(
         self, name: str, energy: float | None = None, conc: float | None = None
@@ -355,9 +357,10 @@ class Simulator:
             }
 
         if throughput_tgt:
-            raise NotImplementedError("Reimplement this!")
-            self.reactions[hash_name]["cumulative_throughput"] = 0.0
-            self.reactions[hash_name]["throughput_tgt"] = throughput_tgt
+            raise NotImplementedError("Willi try to re-implement this...")
+            # self.reactions[hash_name]["cumulative_throughput"] = 0.0
+            # self.reactions[hash_name]["throughput_tgt"] = throughput_tgt
+            # self.track_throughput.append(self.reactions[hash_name])
 
         # We no longer calculate speed_rank here unless it is strictly
         # enforced by the user. Dynamic kinetic ranking (instantaneous vs normal)
@@ -403,6 +406,9 @@ class Simulator:
         ~99.995% of its equilibrium state.
 
         """
+        if self.dt_s == 0.0:  # type: ignore[has-type]
+            return
+
         FAST_THRESHOLD_MULTIPLIER = 10.0
         thr_abs_fast_rxn = FAST_THRESHOLD_MULTIPLIER / self.dt_s  # type: ignore[has-type]
 
@@ -410,23 +416,49 @@ class Simulator:
         table.field_names = [
             tcolors.BOLD + "Reaction" + tcolors.ENDC,
             tcolors.BOLD + "Faster k (s^-1)" + tcolors.ENDC,
+            tcolors.BOLD + "K_eq" + tcolors.ENDC,
             tcolors.BOLD + "Speed Rank" + tcolors.ENDC,
         ]
 
-        for hash_name, reaction in self.reactions.items():
-            # Skip reactions that were explicitly enforced
-            if reaction.get("speed_rank") == "enforced_K_eq":
+        # loop 1: set unspecified speed rank attributes
+        for reaction in self.reactions.values():
+            if reaction.get("speed_rank") is not None:
                 pass
             elif reaction["faster_k"] > thr_abs_fast_rxn:
                 reaction["speed_rank"] = "instantaneous"
-                table.add_row(
-                    [hash_name, f"{reaction['faster_k']:.2e}", "FAST: always at equilibrium"]
-                )
             else:
                 reaction["speed_rank"] = "normal"
-                table.add_row(
-                    [hash_name, f"{reaction['faster_k']:.2e}", "SLOW:  evolved step-by-step"]
-                )
+
+        # loop 2: print table
+        for hash_name, reaction in self.reactions.items():
+            match reaction["speed_rank"]:
+                case "enforced_K_eq":
+                    table.add_row(
+                        [
+                            hash_name,
+                            tcolors.GREY + "N / A" + tcolors.ENDC,
+                            tcolors.BOLD + f"{reaction['enforced_K_eq']:.2e}" + tcolors.ENDC,
+                            tcolors.YELLOW + "K_EQ: always at equilibrium" + tcolors.ENDC,
+                        ]
+                    )
+                case "instantaneous":
+                    table.add_row(
+                        [
+                            hash_name,
+                            tcolors.GREY + f"{reaction['faster_k']:.2e}" + tcolors.ENDC,
+                            tcolors.BOLD + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
+                            tcolors.GREEN + "FAST: always at equilibrium" + tcolors.ENDC,
+                        ]
+                    )
+                case _:
+                    table.add_row(
+                        [
+                            hash_name,
+                            tcolors.BOLD + f"{reaction['faster_k']:.2e}" + tcolors.ENDC,
+                            tcolors.GREY + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
+                            tcolors.RED + "SLOW:  evolved step-by-step" + tcolors.ENDC,
+                        ]
+                    )
 
         # sort rows by the faster_k value in descending order
         table._sort_key = lambda row: float(row[1].split(" ")[0])
@@ -470,7 +502,7 @@ class Simulator:
         # Add epsilon to prevent log(0) warnings
         C_safe = np.maximum(C_array, 1e-15)
 
-        # Log-space dot product for extreme performance
+        # Log-space dot product for better performance
         log_C = np.log(C_safe)
         forward_rates = self.kf_vec * np.exp(self.nu_reactants.T @ log_C)
         backward_rates = self.kb_vec * np.exp(self.nu_products.T @ log_C)
@@ -496,6 +528,13 @@ class Simulator:
         # 'hybr' is MINPACK's Powell hybrid method, excellent for systems of nonlinear equations
         sol = root(residual, C0, method="hybr")
 
+        # if self.track_throughput:
+        #     for rxn_data in self.track_throughput:
+        #         tgt_index = self.species_id_dict[rxn_data["throughput_tgt"]]
+        #         delta = sol.x[tgt_index] - self.C_array[tgt_index]
+        #         frac_contrib = 1
+        #         rxn_data["cumulative_throughput"] += delta * frac_contrib
+
         # Update the main state array, clamping to 0 to eliminate floating-point noise
         self.C_array = np.maximum(sol.x, 0.0)
 
@@ -508,10 +547,11 @@ class Simulator:
         # 5 half lives should lead to >95% progress for the slowest reaction
         N_HALF_LIVES = 5
 
-        slowest_k_fwd = min([rxn["k_rate"] for rxn in self.reactions.values()])
+        slowest_k_fwd = min([rxn["k_rate"] for rxn in self.reactions.values() if "k_rate" in rxn])
 
         assert slowest_k_fwd > 0, (
-            "All reactions must have a positive forward rate constant to estimate simulation time."
+            "The smallest non-zero forward rate constant must "
+            "be greater than zero to estimate simulation time."
         )
 
         t_half_life = np.log(2) / slowest_k_fwd
@@ -521,7 +561,7 @@ class Simulator:
 
         match True:
             case _ if t_s < 60:
-                output = (t_s, "s")
+                output = (round(t_s, 3), "s")
             case _ if t_m < 60:
                 output = (t_m, "m")
             case _:
@@ -574,12 +614,16 @@ class Simulator:
         # Initialize the working concentration array
         self.C_array = np.array([self.species[name]["conc"] for name in self.species_names])
 
-        iterations = int(np.ceil(time_s / self.dt_s))
-        print(
-            f"\n--> Running simulation for {time} {t_units} with the Backwards Euler method "
-            f"({self.dt_s:.1{'f' if self.dt_s > 0.1 else 'e'}} "
-            f"s increments, {iterations} iterations)"
-        )
+        if self.dt_s != 0:
+            iterations = int(np.ceil(time_s / self.dt_s))
+            print(
+                f"\n--> Running simulation for {time} {t_units} with the Backwards Euler method "
+                f"({self.dt_s:.1{'f' if self.dt_s > 0.1 else 'e'}} "
+                f"s increments, {iterations} iterations)"
+            )
+        else:
+            iterations = 0
+
         plot_num_points = min(PLOT_NUM_POINTS, iterations)
         save_every = max(1, int(iterations / plot_num_points)) if plot_num_points > 0 else 1
 
