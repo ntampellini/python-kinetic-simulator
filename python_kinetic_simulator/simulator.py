@@ -6,17 +6,26 @@ from typing import Any, Iterable, cast
 import matplotlib.pyplot as plt
 import numpy as np
 from prettytable import PrettyTable
-from scipy.optimize import least_squares, root
+from scipy.integrate import solve_ivp
+from scipy.optimize import least_squares
 
 K_BOLTZMANN = 1.380649e-23  # J/K
 H_PLANCK = 6.62607015e-34  # J*s
 R = 0.001985877534  # kcal/(mol*K)
 
 # number of points to save to generate final plot
-PLOT_NUM_POINTS = 1000
+MAX_PLOT_NUM_POINTS = 1000
 
-# maximum number of computed steps
-MAX_AUTO_STEPS = 1e4
+# IVP solver method.
+# BDF: Backward Differentiation Formula,
+# good for stiff systems
+# LSODA: automatically switches between non-stiff (Adams) and stiff (BDF) methods
+# seems to be faster for systems that start stiff and become non-stiff.
+IVP_METHOD = "LSODA"
+
+# A reaction that turns over this many times
+# per step is considered physically instantaneous.
+FAST_THRESHOLD_MULTIPLIER = 1e6
 
 
 class tcolors:
@@ -388,32 +397,15 @@ class Simulator:
         If the rate constant k > (FAST_THRESHOLD_MULTIPLIER / dt_s), the reaction will essentially
         reach equilibrium within a single time step, so we flag it as instantaneous.
 
-        From Gemini:
-
-        The Math Behind the Multiplier
-
-        In chemical kinetics, the progression of a first-order (or pseudo-first-order) reaction
-        follows an exponential decay based on its rate constant k and time t:
-
-            Fraction Remaining = e^{-k * delta_t}
-
-        By setting your threshold to 10.0 / dt_s, you are saying the algorithm should switch
-        to the instant equilibrium solver when k * delta_t >= 10.If we plug 10 into that equation:
-
-            e^{-10} ~ 0.000045
-
-        This means that within a single time step, the reaction will reach
-        ~99.995% of its equilibrium state.
-
         """
         if self.dt_s == 0.0:  # type: ignore[has-type]
             return
 
-        FAST_THRESHOLD_MULTIPLIER = 10.0
         thr_abs_fast_rxn = FAST_THRESHOLD_MULTIPLIER / self.dt_s  # type: ignore[has-type]
 
         table = PrettyTable()
         table.field_names = [
+            tcolors.BOLD + "#" + tcolors.ENDC,
             tcolors.BOLD + "Reaction" + tcolors.ENDC,
             tcolors.BOLD + "Faster k (s^-1)" + tcolors.ENDC,
             tcolors.BOLD + "K_eq" + tcolors.ENDC,
@@ -430,33 +422,36 @@ class Simulator:
                 reaction["speed_rank"] = "normal"
 
         # loop 2: print table
-        for hash_name, reaction in self.reactions.items():
+        for r, (hash_name, reaction) in enumerate(self.reactions.items(), start=1):
             match reaction["speed_rank"]:
                 case "enforced_K_eq":
                     table.add_row(
                         [
+                            r,
                             hash_name,
                             tcolors.GREY + "N / A" + tcolors.ENDC,
                             tcolors.BOLD + f"{reaction['enforced_K_eq']:.2e}" + tcolors.ENDC,
-                            tcolors.YELLOW + "K_EQ: always at equilibrium" + tcolors.ENDC,
+                            tcolors.RED + "THERMODYNAMIC: always at equilibrium" + tcolors.ENDC,
                         ]
                     )
                 case "instantaneous":
                     table.add_row(
                         [
+                            r,
                             hash_name,
-                            tcolors.GREY + f"{reaction['faster_k']:.2e}" + tcolors.ENDC,
-                            tcolors.BOLD + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
-                            tcolors.GREEN + "FAST: always at equilibrium" + tcolors.ENDC,
+                            tcolors.BOLD + f"{reaction['faster_k']:.2e}" + tcolors.ENDC,
+                            tcolors.GREY + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
+                            tcolors.YELLOW + "KINETIC, FAST:  evolved step-by-step" + tcolors.ENDC,
                         ]
                     )
                 case _:
                     table.add_row(
                         [
+                            r,
                             hash_name,
                             tcolors.BOLD + f"{reaction['faster_k']:.2e}" + tcolors.ENDC,
-                            tcolors.GREY + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
-                            tcolors.RED + "SLOW:  evolved step-by-step" + tcolors.ENDC,
+                            tcolors.BOLD + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
+                            tcolors.GREEN + "KINETIC, SLOW:  evolved step-by-step" + tcolors.ENDC,
                         ]
                     )
 
@@ -472,29 +467,46 @@ class Simulator:
 
         print(table.get_string())
 
-    def _compile_normal_reactions(self) -> None:
-        """Build NumPy arrays for fully vectorized normal reaction rates."""
-        self.normal_rxns = [r for r in self.reactions.values() if r.get("speed_rank") == "normal"]
-        self.n_normal = len(self.normal_rxns)
+    def _compile_reactions(self) -> None:
+        """Build NumPy arrays for fully vectorized reaction rates."""
+        if self.dt_s == 0.0:  # type: ignore[has-type]
+            return
+
+        self.ode_rxns = [
+            r for r in self.reactions.values() if r.get("speed_rank") in ("normal", "instantaneous")
+        ]
+        self.n_ode = len(self.ode_rxns)
         self.n_species = len(self.species_names)
 
-        # N_species x M_reactions matrices
-        self.nu_reactants = np.zeros((self.n_species, self.n_normal))
-        self.nu_products = np.zeros((self.n_species, self.n_normal))
+        self.nu_reactants = np.zeros((self.n_species, self.n_ode))
+        self.nu_products = np.zeros((self.n_species, self.n_ode))
 
-        self.kf_vec = np.zeros(self.n_normal)
-        self.kb_vec = np.zeros(self.n_normal)
+        self.kf_vec = np.zeros(self.n_ode)
+        self.kb_vec = np.zeros(self.n_ode)
 
-        for j, rxn in enumerate(self.normal_rxns):
-            self.kf_vec[j] = rxn["k_rate"]
-            self.kb_vec[j] = rxn["k_inv"]
+        # prevent float64 matrix singularity via Rate Clipping
+        # A rate that turns over 1e6 times per step is physically instantaneous.
+        max_allowed_k = FAST_THRESHOLD_MULTIPLIER / self.dt_s  # type: ignore[has-type]
+
+        for j, rxn in enumerate(self.ode_rxns):
+            kf = rxn.get("k_rate", 0.0)
+            kb = rxn.get("k_inv", 0.0)
+
+            fastest = max(kf, kb)
+            if fastest > max_allowed_k:
+                # Scale down proportionally to tame stiffness while perfectly preserving K_eq
+                scale = max_allowed_k / fastest
+                kf *= scale
+                kb *= scale
+
+            self.kf_vec[j] = kf
+            self.kb_vec[j] = kb
 
             for r in rxn["reagents"]:
                 self.nu_reactants[self.species_id_dict[r], j] += 1
             for p in rxn["products"]:
                 self.nu_products[self.species_id_dict[p], j] += 1
 
-        # Net stoichiometry matrix (Delta)
         self.nu_net = self.nu_products - self.nu_reactants
 
     def _calculate_rates(self, C_array: np.ndarray) -> np.ndarray:
@@ -510,37 +522,30 @@ class Simulator:
         return cast("np.ndarray", forward_rates - backward_rates)
 
     def _normal_reactions_step(self) -> None:
-        """Evolve all normal reactions using an implicit Backward Euler step via SciPy."""
-        if self.n_normal == 0:
+        """Evolve normal reactions using SciPy's stiff ODE solver."""
+        if self.n_ode == 0:
             return
 
-        C0 = self.C_array.copy()  # type: ignore[has-type]
-
-        def residual(C_next: np.ndarray) -> np.ndarray:
-            """Residual for Backward Euler: F(C_{n+1}) = C_{n+1} - C_n - dt * f(C_{n+1}) = 0."""
-            # Prevent negative concentrations during solver steps
-            C_safe = np.maximum(C_next, 1e-15)
-            rates = self._calculate_rates(C_safe)
-
+        def odefun(t: float, C: np.ndarray) -> np.ndarray:
+            # Calculate rates. C_safe prevents log(0) warnings.
+            rates = self._calculate_rates(C)
             # The rate of change for each species is nu_net @ rates
-            return cast("np.ndarray", C_next - C0 - self.dt_s * (self.nu_net @ rates))  # type: ignore[has-type]
+            return self.nu_net @ rates  # type: ignore
 
-        # 'hybr' is MINPACK's Powell hybrid method, excellent for systems of nonlinear equations
-        sol = root(residual, C0, method="hybr")
+        sol = solve_ivp(
+            odefun,
+            (0.0, self.dt_s),  # type: ignore[has-type]
+            self.C_array,  # type: ignore[has-type]
+            method=IVP_METHOD,
+            rtol=1e-6,
+            atol=1e-9,
+        )
 
-        # if self.track_throughput:
-        #     for rxn_data in self.track_throughput:
-        #         tgt_index = self.species_id_dict[rxn_data["throughput_tgt"]]
-        #         delta = sol.x[tgt_index] - self.C_array[tgt_index]
-        #         frac_contrib = 1
-        #         rxn_data["cumulative_throughput"] += delta * frac_contrib
+        if not sol.success:
+            print(f"Warning: ODE solver failed at time {self.current_time_s}: {sol.message}")  # type: ignore[has-type]
 
-        # Update the main state array, clamping to 0 to eliminate floating-point noise
-        self.C_array = np.maximum(sol.x, 0.0)
-
-        # to reimplement ...
-        # if "cumulative_throughput" in rxn:
-        #     rxn["cumulative_throughput"] += deltaC * rxn["products"].count(rxn["throughput_tgt"])
+        # Update the main state array, clamping to 0 to eliminate tiny float noise
+        self.C_array = np.maximum(sol.y[:, -1], 0.0)
 
     def get_sim_time(self) -> tuple[float, str]:
         """Return an estimated simulation time and unit of measure."""
@@ -577,6 +582,7 @@ class Simulator:
         t_units: str = "s",
         dt_s: float | None = None,
         max_equilib_iters: int = 5,
+        nsteps: int = 1000,
     ) -> None:
         """Run the simulation for a given time, with an optional custom time step (in s)."""
         self.run_t_units = t_units
@@ -599,7 +605,7 @@ class Simulator:
         time_s = time * self.multiplier
 
         if dt_s is None:
-            dt_s = time_s / MAX_AUTO_STEPS
+            dt_s = time_s / nsteps
 
         self.dt_s = dt_s
 
@@ -609,7 +615,7 @@ class Simulator:
 
         # with that, precompile the normal reactions for
         # fast vectorized stepping in the main loop
-        self._compile_normal_reactions()
+        self._compile_reactions()
 
         # Initialize the working concentration array
         self.C_array = np.array([self.species[name]["conc"] for name in self.species_names])
@@ -617,14 +623,14 @@ class Simulator:
         if self.dt_s != 0:
             iterations = int(np.ceil(time_s / self.dt_s))
             print(
-                f"\n--> Running simulation for {time} {t_units} with the Backwards Euler method "
+                f"\n--> Running simulation for {time} {t_units} with the {IVP_METHOD} method "
                 f"({self.dt_s:.1{'f' if self.dt_s > 0.1 else 'e'}} "
                 f"s increments, {iterations} iterations)"
             )
         else:
             iterations = 0
 
-        plot_num_points = min(PLOT_NUM_POINTS, iterations)
+        plot_num_points = min(MAX_PLOT_NUM_POINTS, iterations)
         save_every = max(1, int(iterations / plot_num_points)) if plot_num_points > 0 else 1
 
         # Calculate total number of data points
@@ -637,9 +643,27 @@ class Simulator:
 
         t_start = perf_counter()
 
-        # set solver and equilibrate before the main loop
+        # set solver and equilibrate before the main loop.
+        # This will equilibrate both the "instantaneous" and
+        # "enforced_K_eq" reactions
         self.equilibrium_solver = FastEquilibriumSolver(list(self.species_names), self.reactions)
         self._equilibrate_instantaneous_reactions()
+
+        if self.equilibrium_solver.fast_reactions:
+            print(
+                f"--> Pre-equilibrated {self.equilibrium_solver.n_reactions} "
+                f"THERMODYNAMIC and FAST reactions before starting the main loop."
+            )
+
+        # overwrite the solver, that will only take care of
+        # "enforced_K_eq" reactions in the main loop
+        enforced_eq_reactions = {
+            h: r for h, r in self.reactions.items() if r.get("speed_rank") == "enforced_K_eq"
+        }
+        self.equilibrium_solver = FastEquilibriumSolver(
+            list(self.species_names),
+            enforced_eq_reactions,
+        )
 
         # Set initial data point
         self.time_data[self.data_idx] = 0.0
@@ -654,7 +678,10 @@ class Simulator:
             self._normal_reactions_step()
 
             # then, equilibrate all instantaneous reactions together
-            self._equilibrate_instantaneous_reactions()
+            # (only "enforced_K_eq" reactions will be equilibrated
+            # in the main loop)
+            if enforced_eq_reactions:
+                self._equilibrate_instantaneous_reactions()
 
             # if it's time, collect a datapoint
             if i % save_every == 0:
@@ -706,7 +733,7 @@ class Simulator:
         """
         species_to_plot = species or self.species
 
-        x = np.array(self.time_data) / self.multiplier
+        time_data_in_plot_units = self.time_data / self.multiplier
 
         plt.figure()
         print("\nFinal Concentrations:")
@@ -715,7 +742,7 @@ class Simulator:
 
         for name, concs in self.results.items():
             if name in species_to_plot:
-                plt.plot(x, concs, label=name)
+                plt.plot(time_data_in_plot_units, concs, label=name)
                 s = f"{name:{longest}s} : {concs[-1]:.2f} M"
                 if self.species[name]["conc"] > 0:
                     final_percentage = concs[-1] / self.species[name]["conc"] * 100
