@@ -1,13 +1,16 @@
 """Python Kinetic Simulator: A flexible kinetic simulator for chemical reactions."""
 
 from time import perf_counter
-from typing import Any, Iterable, cast
+from typing import TYPE_CHECKING, Any, Iterable, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
 from prettytable import PrettyTable
 from scipy.integrate import solve_ivp
 from scipy.optimize import least_squares
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 K_BOLTZMANN = 1.380649e-23  # J/K
 H_PLANCK = 6.62607015e-34  # J*s
@@ -19,12 +22,19 @@ MAX_PLOT_NUM_POINTS = 1000
 # IVP solver method.
 # BDF: Backward Differentiation Formula, good for stiff systems
 # LSODA: automatically switches between non-stiff (Adams) and stiff (BDF) methods
-# seems to be faster for systems that start stiff and become non-stiff.
-IVP_METHOD = "LSODA"
+# faster for systems that start stiff and become non-stiff.
+# Radau: implicit Runge-Kutta method, good for stiff systems and allows for
+# DAE formulation to enforce exact equilibria.
+IVP_METHOD = "Radau"
+
+# maximum rate ceiling: clipping
+# unphysically high rates that can cause numerical issues.
+MAX_RATE = 1e12
 
 # A reaction that turns over this many times
-# per step is considered physically instantaneous.
-FAST_THRESHOLD_MULTIPLIER = 1e6
+# per step is considered physically instantaneous,
+# even if below MAX_RATE
+FAST_RXN_REL_THRESHOLD = 1e6
 
 
 class tcolors:
@@ -65,6 +75,17 @@ def time_to_string(total_time: float, verbose: bool = False, digits: int = 1) ->
     timestring += f"{round(total_time, digits):{2 + digits}} {names[3]}"
 
     return timestring
+
+
+def get_arrow(k_eq: float, thr: float = 10.0) -> str:
+    """Return arrows based on reaction K_eq."""
+    if k_eq > thr:
+        return " --> "
+
+    elif k_eq < (1 / thr):
+        return " <=> "
+
+    return " <-- "
 
 
 class FastEquilibriumSolver:
@@ -271,7 +292,6 @@ class Simulator:
         self.T_C = T_C
         self.species: dict[str, dict[str, float]] = {}
         self.reactions: dict[str, dict[str, Any]] = {}
-        # self.track_throughput: list[dict[str, Any]] = []
 
     def add_species(
         self, name: str, energy: float | None = None, conc: float | None = None
@@ -297,8 +317,8 @@ class Simulator:
 
     def add_reaction(
         self,
-        reagents: list[str],
-        products: list[str],
+        reagents: list[str] | str,
+        products: list[str] | str,
         ts_energy: float | None = None,
         rate: float | None = None,
         inv_rate: float | None = None,
@@ -307,7 +327,7 @@ class Simulator:
     ) -> None:
         """Add a reaction with reagents, products, and either a TS energy or a rate constant.
 
-        Reagents and product: lists of strings
+        Reagents and product: lists of strings or space-separated string
         ts_energy: absolute value relative to the
             whole PES, in kcal/mol (overrides rate)
         rate: forward reaction rate, in M^n * s^-1 (overridden by ts_energy)
@@ -317,15 +337,24 @@ class Simulator:
         enforced_K_eq: will consider the reaction instantaneous and always at
             equilibrium obeying the provided constant.
         """
+        if isinstance(reagents, str):
+            reagents = reagents.split()
+
+        if isinstance(products, str):
+            products = products.split()
+
         # check if we know all names
         for name in set(reagents + products):
             if name not in self.species_names:
                 raise NameError(f'State name "{name}" not defined.')
 
-        # create a reaction hash string
-        hash_name = " + ".join(reagents) + " -> " + " + ".join(products)
+        # calculate thermodynamic K_eq
+        K_eq = self.get_K_eq(reagents, products)
 
         if enforced_K_eq is not None:
+            # create a reaction hash string
+            hash_name = " + ".join(reagents) + get_arrow(enforced_K_eq) + " + ".join(products)
+
             self.reactions[hash_name] = {
                 "reagents": reagents,
                 "products": products,
@@ -338,30 +367,35 @@ class Simulator:
                 activation_energy = ts_energy - np.sum(
                     [self.species[name]["energy"] for name in reagents]
                 )
+                assert activation_energy > 0, "Error: Negative activation energy!"
+
                 inverse_act_energy = ts_energy - np.sum(
                     [self.species[name]["energy"] for name in products]
                 )
+                assert inverse_act_energy > 0, "Error: Negative activation energy!"
 
                 # calculate reaction rates
                 k_rate = get_eyring_k(activation_energy, self.T)
                 k_inv = get_eyring_k(inverse_act_energy, self.T)
 
-            elif rate is not None:
-                k_rate = rate
-                k_inv = inv_rate or 0.0
-
             else:
-                raise RuntimeError("Please provide either the reaction rate or absolute ts_energy")
+                k_rate = rate or MAX_RATE
+                k_inv = inv_rate or k_rate / K_eq
+
+            # else:
+            # raise RuntimeError("Please provide either the reaction rate or absolute ts_energy")
+
+            hash_name = " + ".join(reagents) + get_arrow(K_eq) + " + ".join(products)
 
             # add the reaction to the self.reactions attribute
             self.reactions[hash_name] = {
                 "reagents": reagents,
                 "products": products,
-                "activation_energy": self.get_ts_energy(reagents, k_rate),
+                "activation_energy": self.get_ts_energy(k_rate),
                 "k_rate": k_rate,
                 "k_inv": k_inv,
                 "faster_k": k_rate if k_rate > k_inv else k_inv,
-                "K_eq": self.get_K_eq(reagents, products),
+                "K_eq": K_eq,
             }
 
         if throughput_tgt:
@@ -391,14 +425,18 @@ class Simulator:
         """Evaluate the speed rank (instantaneous vs normal) of each reaction based on dt_s.
 
         Define the threshold for instantaneous reactions.
-        If the rate constant k > (FAST_THRESHOLD_MULTIPLIER / dt_s), the reaction will essentially
+        If the rate constant k > (FAST_RXN_REL_THRESHOLD / dt_s), the reaction will essentially
         reach equilibrium within a single time step, so we flag it as instantaneous.
 
         """
-        if self.dt_s == 0.0:  # type: ignore[has-type]
-            return
+        if self.dt_s == 0.0:
+            # If dt_s is zero all reactions are essentially instantaneous
+            # And we want to treat all as instantaneous.
+            dt_s = np.inf
+        else:
+            dt_s = self.dt_s
 
-        thr_abs_fast_rxn = FAST_THRESHOLD_MULTIPLIER / self.dt_s  # type: ignore[has-type]
+        thr_abs_fast_rxn = FAST_RXN_REL_THRESHOLD / dt_s
 
         table = PrettyTable()
         table.field_names = [
@@ -407,13 +445,14 @@ class Simulator:
             tcolors.BOLD + "Faster k (s^-1)" + tcolors.ENDC,
             tcolors.BOLD + "K_eq" + tcolors.ENDC,
             tcolors.BOLD + "Speed Rank" + tcolors.ENDC,
+            tcolors.BOLD + "ΔG‡ (step, kcal/mol)" + tcolors.ENDC,
         ]
 
         # loop 1: set unspecified speed rank attributes
         for reaction in self.reactions.values():
-            if reaction.get("speed_rank") is not None:
+            if reaction.get("speed_rank") is not None:  # already set: must be enforced_K_eq
                 pass
-            elif reaction["faster_k"] > thr_abs_fast_rxn:
+            elif reaction["faster_k"] > thr_abs_fast_rxn or reaction["faster_k"] >= MAX_RATE:
                 reaction["speed_rank"] = "instantaneous"
             else:
                 reaction["speed_rank"] = "normal"
@@ -429,16 +468,35 @@ class Simulator:
                             tcolors.GREY + "N / A" + tcolors.ENDC,
                             tcolors.BOLD + f"{reaction['enforced_K_eq']:.2e}" + tcolors.ENDC,
                             tcolors.RED + "THERMODYNAMIC: always at equilibrium" + tcolors.ENDC,
+                            tcolors.GREY + "N / A" + tcolors.ENDC,
                         ]
                     )
                 case "instantaneous":
+                    # if all we have to do is equilibrate it
+                    if dt_s == np.inf:
+                        s = "equilibrated"
+                        color1 = tcolors.GREY
+                        color2 = tcolors.BOLD
+                    else:
+                        s = " evolved step-by-step"
+                        color1 = tcolors.BOLD
+                        color2 = tcolors.GREY
+
+                    if reaction["activation_energy"] <= self.get_ts_energy(MAX_RATE):
+                        dG_line = tcolors.GREY + "(negligible)" + tcolors.ENDC
+                        k_line = tcolors.GREY + "(fast)" + tcolors.ENDC
+                    else:
+                        dG_line = f"{reaction['activation_energy']:.2f}"
+                        k_line = color1 + f"{reaction['faster_k']:.2e}" + tcolors.ENDC
+
                     table.add_row(
                         [
                             r,
                             hash_name,
-                            tcolors.BOLD + f"{reaction['faster_k']:.2e}" + tcolors.ENDC,
-                            tcolors.GREY + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
-                            tcolors.YELLOW + "KINETIC, FAST:  evolved step-by-step" + tcolors.ENDC,
+                            k_line,
+                            color2 + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
+                            tcolors.YELLOW + f"KINETIC, FAST: {s}" + tcolors.ENDC,
+                            dG_line,
                         ]
                     )
                 case _:
@@ -449,6 +507,7 @@ class Simulator:
                             tcolors.BOLD + f"{reaction['faster_k']:.2e}" + tcolors.ENDC,
                             tcolors.BOLD + f"{reaction['K_eq']:.2e}" + tcolors.ENDC,
                             tcolors.GREEN + "KINETIC, SLOW:  evolved step-by-step" + tcolors.ENDC,
+                            tcolors.BOLD + f"{reaction['activation_energy']:.2f}" + tcolors.ENDC,
                         ]
                     )
 
@@ -466,7 +525,7 @@ class Simulator:
 
     def _compile_reactions(self) -> None:
         """Build NumPy arrays for fully vectorized reaction rates."""
-        if self.dt_s == 0.0:  # type: ignore[has-type]
+        if self.dt_s == 0.0:
             return
 
         self.ode_rxns = [
@@ -481,18 +540,13 @@ class Simulator:
         self.kf_vec = np.zeros(self.n_ode)
         self.kb_vec = np.zeros(self.n_ode)
 
-        # prevent float64 matrix singularity via Rate Clipping
-        # A rate that turns over 1e6 times per step is physically instantaneous.
-        max_allowed_k = FAST_THRESHOLD_MULTIPLIER / self.dt_s  # type: ignore[has-type]
-
         for j, rxn in enumerate(self.ode_rxns):
             kf = rxn.get("k_rate", 0.0)
             kb = rxn.get("k_inv", 0.0)
 
             fastest = max(kf, kb)
-            if fastest > max_allowed_k:
-                # Scale down proportionally to tame stiffness while perfectly preserving K_eq
-                scale = max_allowed_k / fastest
+            if fastest > MAX_RATE:
+                scale = MAX_RATE / fastest
                 kf *= scale
                 kb *= scale
 
@@ -520,6 +574,35 @@ class Simulator:
             self.tracked_indices = np.array([t["idx"] for t in self.tracked_rxns])
             self.tracked_coeffs = np.array([t["coeff"] for t in self.tracked_rxns])
 
+        # Compile DAE matrices if Radau is selected
+        if self.ivp_method == "Radau":
+            self.dae_eq_rxns = [
+                r for r in self.reactions.values() if r.get("speed_rank") == "enforced_K_eq"
+            ]
+            self.n_eq = len(self.dae_eq_rxns)
+
+            if self.n_eq > 0:
+                self.nu_reactants_eq = np.zeros((self.n_species, self.n_eq))
+                self.nu_products_eq = np.zeros((self.n_species, self.n_eq))
+                self.log_K_eq = np.zeros(self.n_eq)
+
+                for j, rxn in enumerate(self.dae_eq_rxns):
+                    self.log_K_eq[j] = np.log(rxn["enforced_K_eq"])
+                    for r in rxn["reagents"]:
+                        self.nu_reactants_eq[self.species_id_dict[r], j] += 1
+                    for p in rxn["products"]:
+                        self.nu_products_eq[self.species_id_dict[p], j] += 1
+
+                self.nu_net_eq = self.nu_products_eq - self.nu_reactants_eq
+
+                # Build the Singular Mass Matrix:
+                # 1 for species, 0 for eq_rates, 1 for throughputs
+                m_diag = np.ones(self.n_species + self.n_eq + self.n_tracked)
+                m_diag[self.n_species : self.n_species + self.n_eq] = 0.0
+                self.mass_matrix = np.diag(m_diag)
+        else:
+            self.n_eq = 0
+
     def _calculate_rates(self, C_array: np.ndarray) -> np.ndarray:
         """Calculate rates for all normal reactions simultaneously."""
         # Add epsilon to prevent log(0) warnings
@@ -533,46 +616,77 @@ class Simulator:
         return cast("np.ndarray", forward_rates - backward_rates)
 
     def _normal_reactions_step(self) -> None:
-        """Evolve normal reactions using SciPy's stiff ODE solver."""
-        if self.n_ode == 0:
+        """Evolve normal reactions using SciPy's stiff ODE or DAE solver."""
+        # Only skip if there are NO kinetic reactions AND NO DAE equilibrium constraints
+        if self.n_ode == 0 and not (self.ivp_method == "Radau" and getattr(self, "n_eq", 0) > 0):
             return
 
         def odefun(t: float, y: np.ndarray) -> np.ndarray:
-            # Extract species concentrations from the state vector
             C = y[: self.n_species]
-            rates = self._calculate_rates(C)
-            dC_dt = self.nu_net @ rates
 
-            # If tracking throughput, append the target rates to the ODE derivative
+            # 1. Kinetic ODEs
+            rates = self._calculate_rates(C) if self.n_ode > 0 else np.zeros(0)
+            dC_dt = self.nu_net @ rates if self.n_ode > 0 else np.zeros(self.n_species)
+
+            # 2. Algebraic DAEs (Radau Only)
+            if self.ivp_method == "Radau" and getattr(self, "n_eq", 0) > 0:
+                r_eq = y[self.n_species : self.n_species + self.n_eq]
+
+                # The rate of change of species includes the continuous flux of the equilibrium
+                dC_dt += self.nu_net_eq @ r_eq
+
+                # The Algebraic Residual: log(K_eq) - log(Q) MUST = 0
+                C_safe = np.maximum(C, 1e-15)
+                log_Q = self.nu_net_eq.T @ np.log(C_safe)
+                algebraic_res = self.log_K_eq - log_Q
+            else:
+                algebraic_res = np.array([])
+
+            # 3. Throughput Tracking
             if self.n_tracked > 0:
                 dT_dt = rates[self.tracked_indices] * self.tracked_coeffs
-                return np.concatenate((dC_dt, dT_dt))
+            else:
+                dT_dt = np.array([])
 
-            return dC_dt  # type: ignore
+            return np.concatenate((dC_dt, algebraic_res, dT_dt))
 
-        # Prepare initial state vector (concentrations + existing throughputs)
-        if self.n_tracked > 0:
-            y0 = np.concatenate((self.C_array, self.throughput_array))  # type: ignore[has-type]
-        else:
-            y0 = self.C_array  # type: ignore[has-type]
+        # Prepare initial state vector
+        y0_parts = [self.C_array]
+
+        # Initial guess for equilibrium flux is 0 (since we are perfectly pre-equilibrated!)
+        if self.ivp_method == "Radau" and getattr(self, "n_eq", 0) > 0:
+            y0_parts.append(np.zeros(self.n_eq))
+
+        if getattr(self, "n_tracked", 0) > 0:
+            y0_parts.append(self.throughput_array)
+
+        y0 = np.concatenate(y0_parts)
+
+        # Configure Solver Options
+        solve_kwargs: dict[str, Any] = {
+            "method": self.ivp_method,
+            "rtol": 1e-6,
+            "atol": 1e-9,
+        }
+        if self.ivp_method == "Radau" and getattr(self, "n_eq", 0) > 0:
+            solve_kwargs["mass_matrix"] = self.mass_matrix
 
         sol = solve_ivp(
             odefun,
-            (0.0, self.dt_s),  # type: ignore[has-type]
+            (0.0, self.dt_s),
             y0,
-            method=IVP_METHOD,
-            rtol=1e-6,
-            atol=1e-9,
+            **solve_kwargs,
         )
 
         if not sol.success:
-            print(f"Warning: ODE solver failed at time {self.current_time_s}: {sol.message}")  # type: ignore[has-type]
+            print(f"Warning: ODE solver failed at time {self.current_time_s}: {sol.message}")
 
-        # Slice the integrated results back into their separate arrays
-        self.C_array = np.maximum(sol.y[: self.n_species, -1], 0.0)
+        # Slice the integrated results back
+        self.C_array: NDArray[np.float64] = np.maximum(sol.y[: self.n_species, -1], 0.0)
 
-        if self.n_tracked > 0:
-            self.throughput_array = sol.y[self.n_species :, -1]
+        if getattr(self, "n_tracked", 0) > 0:
+            tracked_start = self.n_species + (self.n_eq if self.ivp_method == "Radau" else 0)
+            self.throughput_array: NDArray[np.float64] = sol.y[tracked_start:, -1]
 
     def get_sim_time(self) -> tuple[float, str]:
         """Return an estimated simulation time and unit of measure."""
@@ -603,76 +717,8 @@ class Simulator:
 
         return output
 
-    def run(
-        self,
-        time: float | None = None,
-        t_units: str = "s",
-        dt_s: float | None = None,
-        max_equilib_iters: int = 5,
-        nsteps: int = 1000,
-    ) -> None:
-        """Run the simulation for a given time, with an optional custom time step (in s)."""
-        self.run_t_units = t_units
-        self.max_equilib_iters = max_equilib_iters
-
-        # Reset cached solver so it is rebuilt with the current species/reactions.
-        if hasattr(self, "equilibrium_solver"):
-            del self.equilibrium_solver  # type: ignore[has-type]
-
-        if time is None:
-            time, t_units = self.get_sim_time()
-
-        self.multiplier = {
-            "s": 1,
-            "m": 60,
-            "h": 3600,
-            "d": 3600 * 24,
-        }[t_units]
-
-        time_s = time * self.multiplier
-
-        if dt_s is None:
-            dt_s = time_s / nsteps
-
-        self.dt_s = dt_s
-
-        # evaluate which reactions are instantaneous
-        # vs normal based on the provided or default dt_s
-        self.evaluate_dynamic_kinetic_ranking()
-
-        # with that, precompile the normal reactions for
-        # fast vectorized stepping in the main loop
-        self._compile_reactions()
-
-        # Initialize the working concentration array
-        self.C_array = np.array([self.species[name]["conc"] for name in self.species_names])
-
-        # Initialize throughput tracking array
-        self.throughput_array = np.zeros(getattr(self, "n_tracked", 0))
-
-        if self.dt_s != 0:
-            iterations = int(np.ceil(time_s / self.dt_s))
-            print(
-                f"\n--> Running simulation for {time} {t_units} with the {IVP_METHOD} method "
-                f"({self.dt_s:.1{'f' if self.dt_s > 0.1 else 'e'}} "
-                f"s increments, {iterations} iterations)"
-            )
-        else:
-            iterations = 0
-
-        plot_num_points = min(MAX_PLOT_NUM_POINTS, iterations)
-        save_every = max(1, int(iterations / plot_num_points)) if plot_num_points > 0 else 1
-
-        # Calculate total number of data points
-        total_points = 1 + (iterations // save_every)
-
-        # Preallocate arrays
-        self.time_data = np.zeros(total_points)
-        self.conc_data = np.zeros((total_points, len(self.species)))
-        self.data_idx = 0
-
-        t_start = perf_counter()
-
+    def pre_equilibrate(self) -> None:
+        """Pre-equilibrate any instantaneous reactions before starting the main loop."""
         # set solver and equilibrate before the main loop.
         # This will equilibrate both the "instantaneous" and
         # "enforced_K_eq" reactions
@@ -695,13 +741,90 @@ class Simulator:
             enforced_eq_reactions,
         )
 
+    def run(
+        self,
+        time: float | None = None,
+        t_units: str = "s",
+        nsteps: int = 1000,
+        ivp_method: str = "Radau",
+    ) -> None:
+        """Run the simulation for a given time, with an optional custom time step (in s).
+
+        :time: total simulation time (default: estimated from slowest reaction)
+
+        :t_units: time units for input and display ("s", "m", "h", "d")
+
+        :nsteps: number of steps to divide the simulation time into (default: 1000)
+
+        :ivp_method: which SciPy IVP method to use for normal reactions ("BDF", "Radau", "LSODA")
+
+        """
+        self.run_t_units = t_units
+        self.ivp_method = ivp_method
+
+        # Reset cached solver so it is rebuilt with the current species/reactions.
+        if hasattr(self, "equilibrium_solver"):
+            del self.equilibrium_solver
+
+        if time is None:
+            time, t_units = self.get_sim_time()
+
+        self.multiplier = {
+            "s": 1,
+            "m": 60,
+            "h": 3600,
+            "d": 3600 * 24,
+        }[t_units]
+
+        time_s = time * self.multiplier
+        self.dt_s: float = time_s / nsteps
+
+        # evaluate which reactions are instantaneous
+        # vs normal based on the provided or default dt_s
+        self.evaluate_dynamic_kinetic_ranking()
+
+        # with that, precompile the normal reactions for
+        # fast vectorized stepping in the main loop
+        self._compile_reactions()
+
+        # Initialize the working concentration array
+        self.C_array = np.array([self.species[name]["conc"] for name in self.species_names])
+
+        # Initialize throughput tracking array
+        self.throughput_array = np.zeros(getattr(self, "n_tracked", 0))
+
+        if self.dt_s != 0:
+            iterations = int(np.ceil(time_s / self.dt_s))
+            print(
+                f"\n--> Running simulation for {time} {t_units} with the {self.ivp_method} method "
+                f"({self.dt_s:.1{'f' if self.dt_s > 0.1 else 'e'}} "
+                f"s increments, {iterations} iterations)"
+            )
+        else:
+            iterations = 0
+
+        plot_num_points = min(MAX_PLOT_NUM_POINTS, iterations)
+        save_every = max(1, int(iterations / plot_num_points)) if plot_num_points > 0 else 1
+
+        # Calculate total number of data points
+        total_points = 1 + (iterations // save_every)
+
+        # Preallocate arrays
+        self.time_data = np.zeros(total_points)
+        self.conc_data = np.zeros((total_points, len(self.species)))
+        self.data_idx = 0
+
+        t_start = perf_counter()
+
+        self.pre_equilibrate()
+
         # Set initial data point
         self.time_data[self.data_idx] = 0.0
         self.conc_data[self.data_idx] = self.C_array[:]
         self.data_idx += 1
 
         for i in range(1, iterations + 1):
-            self.current_time_s = self.dt_s * i
+            self.current_time_s: float = self.dt_s * i
             loadbar(i, iterations, prefix="Iterations ")
 
             # first, evolve all normal reactions
@@ -710,17 +833,17 @@ class Simulator:
             # then, equilibrate all instantaneous reactions together
             # (only "enforced_K_eq" reactions will be equilibrated
             # in the main loop)
-            if enforced_eq_reactions:
+            if self.equilibrium_solver.n_reactions > 0 and self.ivp_method != "Radau":
                 self._equilibrate_instantaneous_reactions()
 
             # if it's time, collect a datapoint
             if i % save_every == 0:
                 self._add_status_to_results()
 
-            if min(self.current_conc_dict.values()) < -1e-6:
+            if np.min(self.C_array) < -1e-6:
                 s = (
                     "-> Something blew up and we got a negative concentration. "
-                    "(< -1E-6 M, {i} iterations)"
+                    f"(< -1E-6 M, {i} iterations)"
                 )
                 print(s)
                 break
@@ -743,7 +866,7 @@ class Simulator:
         if self.equilibrium_solver.n_reactions == 0:
             return
 
-        for _ in range(self.max_equilib_iters):
+        for _ in range(5):
             # Pass C_array directly to the solver
             C_eq, _, fun_norm, _ = self.equilibrium_solver.calculate_equilibrium_concentrations(
                 self.C_array, **kwargs
@@ -810,15 +933,13 @@ class Simulator:
         plt.ylabel("Concentration (M)")
         plt.show()
 
-    def get_ts_energy(self, reagents: list[str], rate: float) -> float:
-        """Return the absolute TS energy in kcal/mol from reagents and a rate constant.
+    def get_ts_energy(self, rate: float) -> float:
+        """Return the TS activation energy in kcal/mol from a rate constant.
 
-        reagents: list of strings
         rate: forward reaction rate in M^n * s^-1
         """
         activation_energy = -np.log(rate * H_PLANCK / K_BOLTZMANN / self.T) * (R * self.T)
-        reagents_energy = np.sum([self.species[r]["energy"] for r in reagents])
-        return cast("float", activation_energy + reagents_energy)
+        return cast("float", activation_energy)
 
 
 def get_eyring_k(activation_energy: float, T: float = 298.15) -> float:
