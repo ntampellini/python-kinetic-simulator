@@ -49,7 +49,7 @@ def test_stiff_pre_eq() -> None:
     sim.add_species("C", energy=-3)
     sim.add_species("D", energy=-6)
 
-    sim.add_reaction(["A", "cat"], ["A.cat"], ts_energy=1)
+    sim.add_reaction(["A", "cat"], ["A.cat"])
     sim.add_reaction(["A.cat", "B"], ["C", "cat"], ts_energy=23)
     sim.add_reaction(["C", "cat"], ["D", "cat"], ts_energy=28)
 
