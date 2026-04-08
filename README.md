@@ -24,10 +24,10 @@ sim.add_species("C", energy=-30)
 sim.add_reaction(["A"], ["B", "B"], ts_energy=23.0)
 
 # or their rate constant (in M^n * s^-1)
-sim.add_reaction(["B"], ["C"], rate=5e-4)
+sim.add_reaction(["B"], ["C"], rate=5e-4, inv_rate=0.0)
 
-# it is also possible to enforce a K_eq (overriding
-# the energy value assigned to the involved species).
+# It is also possible to enforce a K_eq directly
+# instead of a TS energy or rate/inverse rate.
 # The rate of the reaction will be assumed as fast,
 # to ensure equilibration at any point in time.
 sim.add_reaction(["B"], ["B(adsorbed)"], enforced_K_eq=2.18)
@@ -40,19 +40,19 @@ sim.run(time=10, t_units="h")
 # sim.run(time=0)
 ```
 
-    +---+------------------+-----------------+----------+--------------------------------------+
-    | # |     Reaction     | Faster k (s^-1) |   K_eq   |              Speed Rank              |
-    +---+------------------+-----------------+----------+--------------------------------------+
-    | 1 |    A -> B + B    |     1.83e-03    | 5.09e+02 | KINETIC, SLOW:  evolved step-by-step |
-    | 2 |      B -> C      |     5.00e-04    | 8.89e+18 | KINETIC, SLOW:  evolved step-by-step |
-    | 3 | B -> B(adsorbed) |      N / A      | 2.18e+00 | THERMODYNAMIC: always at equilibrium |
-    +---+------------------+-----------------+----------+--------------------------------------+
+    +---+-------------------+-----------------+----------+---------+----------------------+
+    | # |      Reaction     | Faster k (s^-1) |   K_eq   | Pre-eq. | ΔG‡ (step, kcal/mol) |
+    +---+-------------------+-----------------+----------+---------+----------------------+
+    | 1 | B <=> B(adsorbed) |    (1.00e+10)   | 2.18e+00 |    ✓    |        (4.18)        |
+    | 2 |    A --> B + B    |     1.83e-03    | 5.09e+02 |         |        23.00         |
+    | 3 |      B --> C      |     5.00e-04    | 8.89e+18 |         |        23.83         |
+    +---+-------------------+-----------------+----------+---------+----------------------+
 
     --> Running simulation for 10 h with the LSODA method (36.0 s increments, 1000 iterations)
-    --> Pre-equilibrated 1 THERMODYNAMIC and FAST reactions before starting the main loop.
+    --> Pre-equilibrated 1 fast reactions before starting the main loop.
     Iterations  |##################################################| 100.0%
 
-    --> Simulation complete (0.8 s)
+    --> Simulation complete (0.4 s)
 
 
 Show results:
@@ -73,7 +73,7 @@ sim.show()
 
 
 
-![png](assets/README_files/README_5_2.png)
+![png](assets/README_files/README_5_1.png)
 
 
 
@@ -111,7 +111,7 @@ plt.xlabel("ln(time (s))")
 plt.ylabel("ln(conc. (M))")
 
 # define and plot an interpolation time range
-start, end = 5e1, 1e2  # 1E3
+start, end = 5e1, 3e2  # 1E3
 plt.axvspan(start, end, color="red", alpha=0.25, label="interpolation area")
 
 # get boundary indices of arrays
@@ -159,7 +159,7 @@ sim.add_species("B", energy=0.8)
 sim.add_species("C", energy=-30)
 
 sim.add_reaction(["A"], ["B"], ts_energy=20.0)
-sim.add_reaction(["A", "B"], ["C", "C"], ts_energy=22.1, throughput_tgt="C")
+sim.add_reaction(["A", "B"], ["C", "C"], ts_energy=22.2, throughput_tgt="C")
 sim.add_reaction(["A", "A"], ["C", "C"], ts_energy=21.5, throughput_tgt="C")
 
 sim.run(time=24, t_units="h")
@@ -167,26 +167,26 @@ sim.run(time=24, t_units="h")
 sim.show()
 ```
 
-    +---+----------------+-----------------+----------+--------------------------------------+
-    | # |    Reaction    | Faster k (s^-1) |   K_eq   |              Speed Rank              |
-    +---+----------------+-----------------+----------+--------------------------------------+
-    | 1 |     A -> B     |     5.13e-02    | 2.59e-01 | KINETIC, SLOW:  evolved step-by-step |
-    | 2 | A + B -> C + C |     1.25e-03    | 3.95e+44 | KINETIC, SLOW:  evolved step-by-step |
-    | 3 | A + A -> C + C |     1.05e-03    | 1.02e+44 | KINETIC, SLOW:  evolved step-by-step |
-    +---+----------------+-----------------+----------+--------------------------------------+
+    +---+-----------------+-----------------+----------+---------+----------------------+
+    | # |     Reaction    | Faster k (s^-1) |   K_eq   | Pre-eq. | ΔG‡ (step, kcal/mol) |
+    +---+-----------------+-----------------+----------+---------+----------------------+
+    | 1 |     A <=> B     |     5.13e-02    | 2.59e-01 |         |        20.00         |
+    | 2 | A + B --> C + C |     1.25e-03    | 3.95e+44 |         |        21.40         |
+    | 3 | A + A --> C + C |     1.05e-03    | 1.02e+44 |         |        21.50         |
+    +---+-----------------+-----------------+----------+---------+----------------------+
 
     --> Running simulation for 24 h with the LSODA method (86.4 s increments, 1000 iterations)
     Iterations  |##################################################| 100.0%
 
-    --> Simulation complete (0.4 s)
+    --> Simulation complete (0.2 s)
 
     Final Concentrations:
     A : 0.01 M (0.5 % of initial conc., 99.47 % consumed)
     B : 0.00 M (0.14 % total molar fraction)
     C : 0.99 M (99.34 % total molar fraction)
 
-    Reaction "A + B -> C + C" throughput is 0.228 M, 22.93 % of final "C" conc.
-    Reaction "A + A -> C + C" throughput is 0.766 M, 77.07 % of final "C" conc.
+    Reaction "A + B --> C + C" throughput is 0.228 M, 22.93 % of final "C" conc.
+    Reaction "A + A --> C + C" throughput is 0.766 M, 77.07 % of final "C" conc.
 
 
 
