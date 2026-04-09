@@ -66,6 +66,7 @@ pkginfo = ">=1.10"
 twine = ">=6.1"
 pre-commit = ">=4.4.0,<5"
 prettytable = ">=3.17.0,<4"
+plotly = ">=6.6.0,<7"
 
 [tool.ruff]
 line-length = 100

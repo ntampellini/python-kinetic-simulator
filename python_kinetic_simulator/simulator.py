@@ -314,18 +314,20 @@ class Simulator:
         inv_rate: float | None = None,
         throughput_tgt: str | None = None,
         enforced_K_eq: float | None = None,
+        force_slow: bool = False,
     ) -> None:
         """Add a reaction with reagents, products, and either a TS energy or a rate constant.
 
-        Reagents and product: lists of strings or space-separated string
-        ts_energy: absolute value relative to the
+        :Reagents and product: lists of strings or space-separated string
+        :ts_energy: absolute value relative to the
             whole PES, in kcal/mol (overrides rate)
-        rate: forward reaction rate, in M^n * s^-1 (overridden by ts_energy)
-        inv_rate: reverse reaction rate, in M^n * s^-1 (overridden by ts_energy)
-        throughput_tgt: string with species name - will keep track of how
+        :rate: forward reaction rate, in M^n * s^-1 (overridden by ts_energy)
+        :inv_rate: reverse reaction rate, in M^n * s^-1 (overridden by ts_energy)
+        :throughput_tgt: string with species name - will keep track of how
             much of this species is generated through this reaction
-        enforced_K_eq: will consider the reaction instantaneous and always at
+        :enforced_K_eq: will consider the reaction instantaneous and always at
             equilibrium obeying the provided constant.
+        :force_slow: evolve the reaction step-by-step no matter what.
         """
         if isinstance(reagents, str):
             reagents = reagents.split()
@@ -351,12 +353,12 @@ class Simulator:
             activation_energy = ts_energy - np.sum(
                 [self.species[name]["energy"] for name in reagents]
             )
-            assert activation_energy > 0, "Error: Negative activation energy!"
+            assert activation_energy > 0, "Error: Negative forward activation energy!"
 
             inverse_act_energy = ts_energy - np.sum(
                 [self.species[name]["energy"] for name in products]
             )
-            assert inverse_act_energy > 0, "Error: Negative activation energy!"
+            assert inverse_act_energy > 0, "Error: Negative inverse activation energy!"
 
             # calculate reaction rates
             k_rate = get_eyring_k(activation_energy, self.T)
@@ -377,6 +379,10 @@ class Simulator:
             "k_inv": k_inv,
             "faster_k": k_rate if k_rate > k_inv else k_inv,
             "K_eq": K_eq,
+            "speed_rank": "normal",  # will be overwritten in
+            # evaluate_dynamic_kinetic_ranking
+            # if appropriate
+            "force_slow": force_slow,
         }
 
         if throughput_tgt:
@@ -384,6 +390,11 @@ class Simulator:
             self.reactions[hash_name]["throughput_tgt"] = throughput_tgt
 
         self.slowest_k_fwd = min([rxn["k_rate"] for rxn in self.reactions.values()])
+
+        # sort the reaction dictionary based on k_rate
+        self.reactions = dict(
+            sorted(self.reactions.items(), key=lambda tup: tup[1]["k_rate"], reverse=True)
+        )
 
     def get_K_eq(self, reagents: list[str], products: list[str]) -> float:
         """Return the equilibrium constant for a reaction from reagents and products energies."""
@@ -415,17 +426,14 @@ class Simulator:
             tcolors.BOLD + "ΔG‡ (step, kcal/mol)" + tcolors.ENDC,
         ]
 
-        # loop 1: set unspecified speed rank attributes
+        # loop 1: set instantaneous reactions
         for reaction in self.reactions.values():
             if reaction["faster_k"] > thr_abs_fast_rxn or reaction["faster_k"] >= MAX_RATE:
-                reaction["speed_rank"] = "instantaneous"
-            else:
-                reaction["speed_rank"] = "normal"
-
-        sorted_rxns = sorted(self.reactions.items(), key=lambda tup: tup[1]["k_rate"], reverse=True)
+                if not reaction["force_slow"]:
+                    reaction["speed_rank"] = "instantaneous"
 
         # loop 2: print table
-        for r, (hash_name, reaction) in enumerate(sorted_rxns, start=1):
+        for r, (hash_name, reaction) in enumerate(self.reactions.items(), start=1):
             match reaction["speed_rank"]:
                 case "instantaneous":
                     # if all we have to do is equilibrate it
@@ -514,11 +522,27 @@ class Simulator:
 
         # Compile throughput tracking
         self.tracked_rxns = []
-        for j, rxn in enumerate(self.ode_rxns):
+        for r, (hash_value, rxn) in enumerate(self.reactions.items()):
             if "throughput_tgt" in rxn:
+                if rxn not in self.ode_rxns:
+                    raise Exception(
+                        f"Reaction {r + 1}: ({hash_value}) - Cannot track the "
+                        "throughput of an instantaneous reaction. Evolve it "
+                        "step-by-step with the option force_slow=True."
+                    )
+
                 tgt = rxn["throughput_tgt"]
+
                 # Calculate the net coefficient of the target in this specific reaction
                 coeff = rxn["products"].count(tgt) - rxn["reagents"].count(tgt)
+                if coeff == 0:
+                    coeff = 1
+                    print(
+                        f'--> "{tgt}" does not appear directly in reaction {r + 1}: '
+                        "assuming a coefficient of 1."
+                    )
+
+                j = self.ode_rxns.index(rxn)
                 self.tracked_rxns.append({"idx": j, "coeff": coeff, "reaction_ref": rxn})
 
         self.n_tracked = len(self.tracked_rxns)
@@ -648,7 +672,6 @@ class Simulator:
         the ODE solver.
 
         """
-        self.run_t_units = t_units
         self.ivp_method = ivp_method
         self.separate_speed_ranks = separate_speed_ranks
 
@@ -659,12 +682,13 @@ class Simulator:
         if time is None:
             time, t_units = self.get_sim_time()
 
+        self.run_t_units = t_units
         self.multiplier = {
             "s": 1,
             "m": 60,
             "h": 3600,
             "d": 3600 * 24,
-        }[t_units]
+        }[self.run_t_units]
 
         time_s = time * self.multiplier
         self.dt_s: float = time_s / nsteps
@@ -742,6 +766,8 @@ class Simulator:
             for i, t_info in enumerate(self.tracked_rxns):
                 t_info["reaction_ref"]["cumulative_throughput"] = float(self.throughput_array[i])
 
+        self.print_throughput()
+
         print(f"\n--> Simulation complete ({time_to_string(perf_counter() - t_start)})")
 
     def _equilibrate_instantaneous_reactions(self, **kwargs: Any) -> None:
@@ -771,10 +797,27 @@ class Simulator:
         self.conc_data[self.data_idx] = self.C_array.copy()
         self.data_idx += 1
 
+    def print_throughput(self) -> None:
+        """Print throughput information."""
+        if self.dt_s == 0.0:
+            return
+
+        print()
+        for r, (_, reaction) in enumerate(self.reactions.items()):
+            if "cumulative_throughput" in reaction:
+                fraction = (
+                    reaction["cumulative_throughput"] / self.results[reaction["throughput_tgt"]][-1]
+                )
+                print(
+                    f"--> Reaction {tcolors.BOLD}{r + 1:>2}{tcolors.ENDC} throughput is "
+                    f"{reaction['cumulative_throughput']:.5f} M, "
+                    f'{fraction * 100:6.2f} % of final "{reaction["throughput_tgt"]}" conc.'
+                )
+
     def show(self, species: Iterable[str] | None = None) -> None:
         """Show the concentration profiles of the species over time.
 
-        species: iterable of strings of species to show, defaulting to all species.
+        :species: iterable of strings of species to show, defaulting to all species.
         """
         species_to_plot = species or self.species
 
@@ -788,7 +831,7 @@ class Simulator:
         for name, concs in self.results.items():
             if name in species_to_plot:
                 plt.plot(time_data_in_plot_units, concs, label=name)
-                s = f"{name:{longest}s} : {concs[-1]:.2f} M"
+                s = f"{name:{longest}s} : {concs[-1]:.5f} M"
                 if self.species[name]["conc"] > 0:
                     final_percentage = concs[-1] / self.species[name]["conc"] * 100
                     s += (
@@ -798,21 +841,10 @@ class Simulator:
 
                 else:
                     final_fraction = concs[-1] / sum_of_final_concs
-                    s += f" ({final_fraction * 100:.2f} % total molar fraction)"
+                    s += f" ({final_fraction * 100:5.2f} % total molar fraction)"
                 print(s)
 
         print()
-
-        for hash_name, reaction in self.reactions.items():
-            if "cumulative_throughput" in reaction:
-                fraction = (
-                    reaction["cumulative_throughput"] / self.results[reaction["throughput_tgt"]][-1]
-                )
-                print(
-                    f'Reaction "{hash_name}" throughput is '
-                    f"{reaction['cumulative_throughput']:.3f} M, "
-                    f'{fraction * 100:.2f} % of final "{reaction["throughput_tgt"]}" conc.'
-                )
 
         plt.legend()
         plt.title(f"Concentrations over time (T={self.T_C} °C)")
