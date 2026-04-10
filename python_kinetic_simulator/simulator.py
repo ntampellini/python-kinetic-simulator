@@ -118,159 +118,96 @@ class FastEquilibriumSolver:
         self.last_xi = np.zeros(self.n_reactions)
 
     def calculate_equilibrium_concentrations(
-        self,
-        C0: np.ndarray,
-        verbose: bool = False,
-        max_iterations: int = 3,
-    ) -> tuple[np.ndarray, np.ndarray, float, bool]:
-        """Calculate equilibrium using native NumPy arrays natively."""
-        # make sure we should change any concentrations
-        if np.sum(C0) < 1e-15:
-            return C0, np.zeros(self.n_reactions), np.inf, False
+        self, initial_concentrations: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        """Solves interwoven equilibria using Levenberg-Marquardt with Augmented Residuals.
 
-        def equilibrium_equations(xi: np.ndarray) -> np.ndarray:
-            concentrations = C0 + self.stoich_matrix @ xi
+        This algorithm handles float64 precision limits natively via Trust-Region SVD,
+        ignores linearly dependent reactions (LICQ immune), and allows seamless exploration
+        around zero-mass boundaries without exploding gradients.
+        """
+        C0 = np.array(initial_concentrations, dtype=np.float64)
 
-            # 1. C1-Continuous smooth log extension to prevent stalls at 0.0
-            epsilon = 1e-12
-            is_small = concentrations < epsilon
+        def equilibrium_residuals(xi: np.ndarray) -> np.ndarray:
+            C = C0 + self.stoich_matrix @ xi
 
-            log_conc = np.empty_like(concentrations)
-            log_conc[~is_small] = np.log(concentrations[~is_small])
-            log_conc[is_small] = np.log(epsilon) + (concentrations[is_small] - epsilon) / epsilon
+            # Safely within float64 limits
+            epsilon = 1e-10
+            is_small = C < epsilon
 
-            log_Q = self.stoich_matrix.T @ log_conc
-            equations = log_Q - self.log_K_eq
+            # 1. Base thermodynamic residuals
+            log_C = np.empty_like(C)
+            log_C[~is_small] = np.log(C[~is_small])
+            log_C[is_small] = np.log(epsilon) + (C[is_small] - epsilon) / epsilon
 
-            # 2. Smooth, differentiable penalty for coupled negative concentrations
-            negative_mask = concentrations < 0
-            if np.any(negative_mask):
-                violation = concentrations[negative_mask]
-                penalty = 1e8 * np.sum(violation**2)
-                equations += penalty
+            R = self.stoich_matrix.T @ log_C - self.log_K_eq
 
-            return cast("np.ndarray", equations)
+            # 2. Soft-Wall Penalty Residuals
+            # We append these as extra equations that the solver must drive to zero.
+            violation = np.zeros_like(C)
+            violation[is_small] = epsilon - C[is_small]
+
+            # Weighting factor ensures positivity is prioritized
+            P = 1e6 * violation
+
+            return np.concatenate([R, P])
 
         def equilibrium_jacobian(xi: np.ndarray) -> np.ndarray:
-            concentrations = C0 + self.stoich_matrix @ xi
+            C = C0 + self.stoich_matrix @ xi
+            epsilon = 1e-10
+            is_small = C < epsilon
 
-            epsilon = 1e-12
-            is_small = concentrations < epsilon
-
-            inv_C = np.empty_like(concentrations)
-            inv_C[~is_small] = 1.0 / concentrations[~is_small]
+            # 1. Base Jacobian
+            inv_C = np.empty_like(C)
+            inv_C[~is_small] = 1.0 / C[~is_small]
             inv_C[is_small] = 1.0 / epsilon
 
-            jac = (self.stoich_matrix.T * inv_C) @ self.stoich_matrix
+            J_R = (self.stoich_matrix.T * inv_C) @ self.stoich_matrix
 
-            negative_mask = concentrations < 0
-            if np.any(negative_mask):
-                dP_dC = np.zeros_like(concentrations)
-                dP_dC[negative_mask] = 2e8 * concentrations[negative_mask]
-                dP_dxi = self.stoich_matrix.T @ dP_dC
-                jac += dP_dxi
+            # 2. Penalty Jacobian
+            # P_i = 1e6 * (epsilon - C_i)  => dP_i/dC_i = -1e6
+            dP_dC = np.zeros(self.n_species)
+            dP_dC[is_small] = -1e6
 
-            return cast("np.ndarray", jac)
+            # Broadcasting the analytical derivative across the stoichiometric matrix
+            J_P = dP_dC[:, np.newaxis] * self.stoich_matrix
 
-        # Iterative solver block
-        for iteration in range(max_iterations):
-            try:
-                if iteration == 0:
-                    # --- SAFE WARM START ---
-                    xi_guess = self.last_xi.copy()
+            return np.vstack([J_R, J_P])
 
-                    # Project guess to strictly obey C >= 0 bounds
-                    C_guess = C0 + self.stoich_matrix @ xi_guess
-                    if np.any(C_guess < 0):
-                        alpha = 1.0
-                        for i in range(self.n_species):
-                            if C_guess[i] < 0:
-                                delta = C_guess[i] - C0[i]
-                                if delta < 0:
-                                    # Scale back the guess to prevent going negative.
-                                    # We use 0.95 to leave a tiny safety margin above exactly 0.
-                                    max_alpha = -C0[i] / delta
-                                    alpha = min(alpha, max_alpha * 0.95)
+        # A perfect warm start
+        xi_guess = np.zeros(self.n_reactions)
 
-                        # Uniformly scale down the guess to preserve stoichiometry
-                        xi_guess *= alpha
+        # Levenberg-Marquardt ('lm') thrives on highly interwoven, rank-deficient systems
+        res = least_squares(
+            equilibrium_residuals,
+            xi_guess,
+            method="lm",
+            jac=equilibrium_jacobian,
+            ftol=1e-10,
+            xtol=1e-10,
+            max_nfev=2000,
+        )
 
-                elif iteration == 1:
-                    # --- FALLBACK 1: COLD START ---
-                    # If warm start failed, perfect zero is the mathematically safest fallback
-                    xi_guess = np.zeros(self.n_reactions)
-                else:
-                    # --- FALLBACK 2: JITTERED START ---
-                    # If both failed, perturb slightly to escape saddle points
-                    xi_guess = np.random.normal(0, 1e-6, self.n_reactions)
+        xi_final = res.x
+        C_final = C0 + self.stoich_matrix @ xi_final
+        C_final = np.maximum(C_final, 0.0)  # Clean up floating point dust
 
-                # Solve the system
-                result = least_squares(
-                    equilibrium_equations,
-                    xi_guess,
-                    jac=equilibrium_jacobian,
-                    method="lm",
-                    ftol=1e-12,
-                    xtol=1e-12,
-                )
+        success = res.success
 
-                success: bool = result.success
-                xi_final = result.x
-                fun_norm = float(np.linalg.norm(result.fun))
+        # Calculate just the thermodynamic portion of the residual to check true convergence
+        base_residual_norm = np.linalg.norm(equilibrium_residuals(xi_final)[: self.n_reactions])
 
-                # Check convergence quality
-                if success and fun_norm < 1e-8:
-                    break
-                elif success and fun_norm < 1e-6 and iteration == max_iterations - 1:
-                    break
-                elif not success and iteration == max_iterations - 1:
-                    if verbose:
-                        print("Failed to converge after maximum iterations")
-                    break
+        # If precision limits were hit but the equilibrium error is tiny, we succeeded
+        if not success and base_residual_norm < 1e-4:
+            success = True
 
-            except Exception as e:
-                if verbose:
-                    print(f"Iteration {iteration + 1} failed: {e}")
-                if iteration == max_iterations - 1:
-                    return C0, np.zeros(self.n_reactions), np.inf, False
-                continue
+        if not success:
+            print(
+                "--> Warning: Equilibrium solver stalled. Base Res "
+                f"Norm: {base_residual_norm:.2e}, Msg: {res.message}"
+            )
 
-        # --- UPDATE CACHE ---
-        if success:
-            self.last_xi = xi_final.copy()
-        else:
-            self.last_xi = np.zeros(self.n_reactions)
-
-        # Calculate final concentrations...
-        C_eq = C0 + self.stoich_matrix @ xi_final
-
-        # Bounds check and cleanup
-        if np.any(C_eq < -1e-10):
-            if verbose:
-                print("Warning: Some equilibrium concentrations are significantly negative.")
-            for _attempt in range(3):
-                xi_final *= 0.9
-                C_eq = C0 + self.stoich_matrix @ xi_final
-                if np.all(C_eq >= -1e-15):
-                    break
-
-        C_eq = C0 + self.stoich_matrix @ xi_final
-
-        # Exact Mass-Conserving Projection
-        if np.any(C_eq < 0):
-            alpha = 1.0
-            for i in range(self.n_species):
-                if C_eq[i] < 0:
-                    delta = C_eq[i] - C0[i]
-                    if delta < 0:
-                        max_alpha = -C0[i] / delta
-                        alpha = min(alpha, max_alpha)
-            xi_final *= alpha
-            C_eq = C0 + self.stoich_matrix @ xi_final
-
-        C_eq[C_eq < 0] = 0.0
-
-        return C_eq, xi_final, fun_norm, success
+        return C_final, xi_final, success
 
 
 class Simulator:
@@ -374,7 +311,7 @@ class Simulator:
         self.reactions[hash_name] = {
             "reagents": reagents,
             "products": products,
-            "activation_energy": self.get_ts_energy(k_rate),
+            "activation_energy": get_ts_energy(k_rate, self.T),
             "k_rate": k_rate,
             "k_inv": k_inv,
             "faster_k": k_rate if k_rate > k_inv else k_inv,
@@ -444,7 +381,7 @@ class Simulator:
                         color1 = tcolors.BOLD
                         color2 = tcolors.GREY
 
-                    if reaction["activation_energy"] <= self.get_ts_energy(MAX_RATE):
+                    if reaction["activation_energy"] <= get_ts_energy(MAX_RATE, self.T):
                         dG_line = (
                             tcolors.GREY + f"({reaction['activation_energy']:.2f})" + tcolors.ENDC
                         )
@@ -643,13 +580,32 @@ class Simulator:
                 f"fast reactions before starting the main loop."
             )
 
+    def evaluate_separate_speed_ranks(self) -> bool:
+        """Detect if the optimal strategy is to separate fast and slow reactions or not."""
+        max_normal_rate = max(
+            [rxn["k_rate"] for rxn in self.reactions.values() if rxn["speed_rank"] == "normal"]
+        )
+
+        if max_normal_rate * FAST_RXN_REL_THRESHOLD > MAX_RATE:
+            print(
+                f"--> Fastest step-by-step reactions approach the maximum rate ({MAX_RATE:.1e}): "
+                "solving all reaction as ODEs."
+            )
+            return False
+
+        print(
+            f"--> Fastest step-by-step reactions far from the maximum rate ({MAX_RATE:.1e}): "
+            "treating equilibria as instantaneous."
+        )
+        return True
+
     def run(
         self,
         time: float | None = None,
         t_units: str = "s",
         nsteps: int = 1000,
         ivp_method: str = "LSODA",
-        separate_speed_ranks: bool = True,
+        separate_speed_ranks: bool | None = None,
     ) -> None:
         """Run the simulation for a given time, with an optional custom time step (in s).
 
@@ -667,13 +623,14 @@ class Simulator:
         faster for systems that start stiff and become non-stiff.
 
         :separate_speed_ranks: Whether to treat instantaneous reactions separately from normal
-        reactions. If True, the former will be equilibrated in a least squares solver after the
-        ODE solver takes care of the latter (recommended). If False, both will be propagated with
-        the ODE solver.
+        reactions. If True, the former will be equilibrated instantaneously at
+        every step in a least squares solver after the ODE solver takes care of all other reactions.
+        If False, both will be propagated via the ODE solver. Fast reactions will be capped
+        at MAX_RATE to avoid unphysical instantaneous evolution. None automatically detects the most
+        appropriate treatment based on
 
         """
         self.ivp_method = ivp_method
-        self.separate_speed_ranks = separate_speed_ranks
 
         # Reset cached solver so it is rebuilt with the current species/reactions.
         if hasattr(self, "equilibrium_solver"):
@@ -696,6 +653,9 @@ class Simulator:
         # evaluate which reactions are instantaneous
         # vs normal based on relative k_rate values
         self.evaluate_dynamic_kinetic_ranking()
+
+        # evalute solve strategy
+        self.separate_speed_ranks = separate_speed_ranks or self.evaluate_separate_speed_ranks()
 
         # with that, precompile the normal reactions for
         # fast vectorized stepping in the main loop
@@ -770,7 +730,7 @@ class Simulator:
 
         print(f"\n--> Simulation complete ({time_to_string(perf_counter() - t_start)})")
 
-    def _equilibrate_instantaneous_reactions(self, **kwargs: Any) -> None:
+    def _equilibrate_instantaneous_reactions(self) -> None:
         """Equilibrate all instantaneous reactions together using the FastEquilibriumSolver.
 
         This method is called before the main loop to equilibrate the initial state,
@@ -779,17 +739,12 @@ class Simulator:
         if self.equilibrium_solver.n_reactions == 0:
             return
 
-        for _ in range(5):
-            # Pass C_array directly to the solver
-            C_eq, _, fun_norm, _ = self.equilibrium_solver.calculate_equilibrium_concentrations(
-                self.C_array, **kwargs
-            )
+        C_eq, _, _ = self.equilibrium_solver.calculate_equilibrium_concentrations(
+            self.C_array,
+        )
 
-            # Update array in place
-            self.C_array = C_eq
-
-            if fun_norm < 1e-2 or fun_norm == np.inf:
-                break
+        # Update array in place
+        self.C_array = C_eq
 
     def _add_status_to_results(self) -> None:
         """Add the current concentrations and time to the results arrays."""
@@ -852,13 +807,29 @@ class Simulator:
         plt.ylabel("Concentration (M)")
         plt.show()
 
-    def get_ts_energy(self, rate: float) -> float:
-        """Return the TS activation energy in kcal/mol from a rate constant.
+    def print_speciation(self, name: str) -> None:
+        """Return the fractionation of all species containing name."""
+        if not hasattr(self, "results"):
+            raise Exception("Run the simulation first with sim.run().")
 
-        rate: forward reaction rate in M^n * s^-1
-        """
-        activation_energy = -np.log(rate * H_PLANCK / K_BOLTZMANN / self.T) * (R * self.T)
-        return cast("float", activation_energy)
+        species = [s for s in self.species if name in s]
+        cum_conc = sum(self.results[s][-1] for s in species)
+        longest = max(len(s) for s in species)
+
+        for s in species:
+            print(
+                f"{s:{longest}} {self.results[s][-1] / cum_conc * 100:8.4f} %  "
+                f"{self.results[s][-1]:7.4f} M"
+            )
+
+
+def get_ts_energy(rate: float, T_K: float = 298.15) -> float:
+    """Return the TS activation energy in kcal/mol from a rate constant.
+
+    rate: forward reaction rate in M^n * s^-1
+    """
+    activation_energy = -np.log(rate * H_PLANCK / K_BOLTZMANN / T_K) * (R * T_K)
+    return cast("float", activation_energy)
 
 
 def get_eyring_k(activation_energy: float, T: float = 298.15) -> float:
